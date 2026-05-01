@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-<title>Pew pew pew</title>
+<title>Vaisseau Spatial</title>
 <style>
   * { margin:0; padding:0; box-sizing:border-box; }
   body { background:#000; overflow:hidden; user-select:none; }
@@ -105,7 +105,7 @@
     <div class="smenu-sub">Space Combat Simulator</div>
     <div class="smenu-hi">HI-SCORE &nbsp;<span id="menu-hi-val">000000</span></div>
     <div class="smenu-sep"></div>
-    <div class="smenu-label">Nom du u</div>
+    <div class="smenu-label">Nom du vaisseau</div>
     <input id="menu-name" type="text" maxlength="10" value="ACE" spellcheck="false" autocomplete="off">
     <button id="menu-start">▶ &nbsp;Lancer la partie</button>
     <div class="smenu-controls">
@@ -380,7 +380,7 @@ function evalTouches(touches){ keys.left=false; keys.right=false; for(const t of
 canvas.addEventListener('touchstart', e=>{
   e.preventDefault();
   if(spectMode){
-    // En mode spectateur : tap gauche = u précédent, tap droit = suivant
+    // En mode spectateur : tap gauche = vaisseau précédent, tap droit = suivant
     for(const t of e.changedTouches){
       if(t.clientX<window.innerWidth/2) spectIdx--; else spectIdx++;
     }
@@ -559,8 +559,8 @@ for(let i=0;i<10;i++){
 }
 
 // ── État de partie ────────────────────────────────────────────────────────
-const teamLives={blue:TEAM_LIVES, red:1500};
-const initialLives={blue:TEAM_LIVES, red:1500};
+const teamLives={blue:TEAM_LIVES, red:2000};
+const initialLives={blue:TEAM_LIVES, red:2000};
 let gameOver=null;
 let _playerLives=3; // Vies joueur (style arcade)
 let _score=0, _kills=0, _caps=0;
@@ -589,7 +589,7 @@ function addLog(parts){
 }
 
 
-// ── ux IA ──────────────────────────────────────────────────────────
+// ── Vaisseaux IA ──────────────────────────────────────────────────────────
 function mkAI(team){
   const fr=spawns.filter(s=>s.team===team);
   const sp=fr[Math.floor(Math.random()*fr.length)];
@@ -1042,7 +1042,7 @@ function updateAI(ai,enemies){
     // Rouges : pénalité CD vs joueur / Bleus : quasi pas de CD (tir en continu)
     const cdBonus=vsPlayer?35:(ai.team==='blue'?-(BURST_CD+35):0);
     if(ai.fireTimer<=0&&tDist<FIRE_RANGE&&Math.abs(fd+aimNoise)<0.22&&repStr<1){
-      ai.burstLeft=BURST_SIZE; ai.burstTimer=1; ai.fireTimer=Math.max(8,BURST_CD+cdBonus+Math.floor(Math.random()*12));
+      ai.burstLeft=BURST_SIZE; ai.burstTimer=1; ai.fireTimer=Math.max(ai.team==='blue'?16:8,BURST_CD+cdBonus+Math.floor(Math.random()*12));
       ai.burstTarget=target;
     }
   }
@@ -1306,9 +1306,21 @@ function update(){
     tickShield(ship);
     if(ship.hit>0) ship.hit--;
 
-    // Tir automatique joueur vers rouge le plus proche
-    let pTgt=null, pTDist=Infinity;
-    for(const e of reds){if(e.dead)continue;const d=Math.hypot(e.x-ship.x,e.y-ship.y);if(d<pTDist){pTDist=d;pTgt=e;}}
+    // Tir automatique joueur : parmi les ennemis à portée, choisir le mieux aligné
+    let pTgt=null, pTDist=Infinity, pBestAfd=Infinity;
+    for(const e of reds){
+      if(e.dead) continue;
+      const d=Math.hypot(e.x-ship.x,e.y-ship.y);
+      if(d>=FIRE_RANGE) continue;
+      const t2=Math.min(d/BULLET_SPEED,45);
+      let fd=Math.atan2(e.y+e.vy*t2-ship.y,e.x+e.vx*t2-ship.x)-ship.angle;
+      while(fd>Math.PI)fd-=Math.PI*2; while(fd<-Math.PI)fd+=Math.PI*2;
+      const afd=Math.abs(fd);
+      // Priorité : arc de tir d'abord, puis distance
+      if(pTgt===null||afd<pBestAfd||(afd<0.30&&d<pTDist)){
+        pTgt=e; pTDist=d; pBestAfd=afd;
+      }
+    }
     if(ship.burstLeft>0){
       if(--ship.burstTimer<=0){
         if(bullets.length<MAX_BULLETS){
@@ -1322,7 +1334,7 @@ function update(){
       const t2=Math.min(pTDist/BULLET_SPEED,45);
       let fd=Math.atan2(pTgt.y+pTgt.vy*t2-ship.y,pTgt.x+pTgt.vx*t2-ship.x)-ship.angle;
       while(fd>Math.PI)fd-=Math.PI*2; while(fd<-Math.PI)fd+=Math.PI*2;
-      if(ship.fireTimer<=0&&pTDist<FIRE_RANGE&&Math.abs(fd)<0.22){
+      if(ship.fireTimer<=0&&Math.abs(fd)<0.30){
         ship.burstLeft=BURST_SIZE; ship.burstTimer=1; ship.fireTimer=Math.max(8,BURST_CD-(BURST_CD+35)+Math.floor(Math.random()*12));
         ship.burstTarget=pTgt;
       }
@@ -1801,12 +1813,21 @@ function drawAsteroids(){
     const sx=a.wx-_camX+cx, sy=a.wy-_camY+cy;
     if(sx<-CULL_MG||sx>canvas.width+CULL_MG||sy<-CULL_MG||sy>canvas.height+CULL_MG) continue;
     ctx.save(); ctx.translate(sx,sy); ctx.rotate(a.rot);
+    // Polygone comme chemin de base
+    ctx.beginPath(); ctx.moveTo(a.verts[0][0],a.verts[0][1]);
+    for(let i=1;i<a.verts.length;i++) ctx.lineTo(a.verts[i][0],a.verts[i][1]);
+    ctx.closePath();
+    // Clip : tout ce qui suit reste DANS le polygone → pas de débordement visible
+    ctx.save(); ctx.clip();
     ctx.beginPath(); ctx.arc(0,0,a.radius*0.9,0,Math.PI*2);
     ctx.fillStyle='rgba(30,22,14,0.55)'; ctx.fill();
+    ctx.restore();
+    // Remplissage + contour du polygone
     ctx.beginPath(); ctx.moveTo(a.verts[0][0],a.verts[0][1]);
     for(let i=1;i<a.verts.length;i++) ctx.lineTo(a.verts[i][0],a.verts[i][1]);
     ctx.closePath();
     ctx.fillStyle='#3a3228'; ctx.fill(); ctx.strokeStyle='#7a6a54'; ctx.lineWidth=1.2; ctx.stroke();
+    // Cratères (détail texture)
     const cr=a.radius*0.28; ctx.strokeStyle='rgba(140,120,90,0.35)'; ctx.lineWidth=0.8;
     ctx.beginPath(); ctx.arc(-cr*.6,cr*.3,cr*.55,0,Math.PI*2); ctx.stroke();
     ctx.beginPath(); ctx.arc(cr*.5,-cr*.5,cr*.35,0,Math.PI*2); ctx.stroke();
