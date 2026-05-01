@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-<title>Vaisseau Spatial</title>
+<title>Pew pew pew</title>
 <style>
   * { margin:0; padding:0; box-sizing:border-box; }
   body { background:#000; overflow:hidden; user-select:none; }
@@ -105,7 +105,7 @@
     <div class="smenu-sub">Space Combat Simulator</div>
     <div class="smenu-hi">HI-SCORE &nbsp;<span id="menu-hi-val">000000</span></div>
     <div class="smenu-sep"></div>
-    <div class="smenu-label">Nom du vaisseau</div>
+    <div class="smenu-label">Nom du u</div>
     <input id="menu-name" type="text" maxlength="10" value="ACE" spellcheck="false" autocomplete="off">
     <button id="menu-start">▶ &nbsp;Lancer la partie</button>
     <div class="smenu-controls">
@@ -380,7 +380,7 @@ function evalTouches(touches){ keys.left=false; keys.right=false; for(const t of
 canvas.addEventListener('touchstart', e=>{
   e.preventDefault();
   if(spectMode){
-    // En mode spectateur : tap gauche = vaisseau précédent, tap droit = suivant
+    // En mode spectateur : tap gauche = u précédent, tap droit = suivant
     for(const t of e.changedTouches){
       if(t.clientX<window.innerWidth/2) spectIdx--; else spectIdx++;
     }
@@ -589,7 +589,7 @@ function addLog(parts){
 }
 
 
-// ── Vaisseaux IA ──────────────────────────────────────────────────────────
+// ── ux IA ──────────────────────────────────────────────────────────
 function mkAI(team){
   const fr=spawns.filter(s=>s.team===team);
   const sp=fr[Math.floor(Math.random()*fr.length)];
