@@ -2368,8 +2368,8 @@ function drawGameOver(){
 
 function drawMinimap(){
   const W=canvas.width, H=canvas.height;
-  const MS=isMobile?100:155;
-  const MX=W-MS-10, MY=isMobile?H-MS-56:H-MS-10;
+  const MS=isMobile?90:155;
+  const MX=W-MS-6, MY=isMobile?76:H-MS-10;
   const scale=MS/(MAP_RADIUS*2);
   const mcx=MX+MS/2, mcy=MY+MS/2;
   // Fond circulaire
