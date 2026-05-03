@@ -285,6 +285,14 @@ let _shootThrottle=0;
 function sfxShoot(wx,wy){ if(++_shootThrottle%4===0) playSound('shoot',0.22,wx,wy); }
 let _astSfxThrottle=0; // anti-saturation sonore des impacts d'astéroïdes
 let _deathFxTimer=0;  // effet dramatique post-mort joueur
+let _gameTick=0;      // compteur de frames global
+// ── Système de Rally ─────────────────────────────────────────────────────
+let _rallyTimer=7200+Math.floor(Math.random()*3600); // frames jusqu'au prochain rally (~2-3 min)
+let _rallyMarkers=[]; // [{t3, team, life, maxLife}] marqueurs minimap actifs
+let _rallyNotif=null;  // {lines:[{text,col}], life, maxLife, type} — bannière centrale
+const RALLY_RANGE=3800;  // rayon de recrutement des alliés
+const RALLY_ALLY_COUNT=8; // nb max d'alliés mobilisés
+const RALLY_DURATION=600; // durée du rally (frames)
 
 // ── Constantes ────────────────────────────────────────────────────────────
 const GRID           = 60;
@@ -304,18 +312,38 @@ const BURST_SIZE     = 2;
 const BURST_DELAY    = 9;
 const BURST_CD       = 38;
 const RESPAWN_FRAMES = 600;
-const AI_HP          = 3;
-const RED_AI_HP      = 2; // Rouges deux fois moins résistants
-const PLAYER_HP      = 6;
+const AI_HP          = 4;
+const RED_AI_HP      = 4; // Rouges même HP que les bleus
+const PLAYER_HP      = 8;
 const ENGAGE_DIST    = 220;
-const TEAM_LIVES     = 500;
+const TEAM_LIVES     = 1000;
 const SPAWN_RADIUS   = 140;
-const CAPTURE_FRAMES = 300;
-const SHIELD_MAX     = 8;
-const RED_SHIELD_MAX = 2; // Bouclier rouge très fragile
+const CAPTURE_FRAMES = 3000;
+const SHIELD_MAX     = 12;
+const RED_SHIELD_MAX = 10; // Bouclier rouge légèrement inférieur
 const SPAWN_IMMUNE   = 180; // 3 secondes à 60fps
 const SHIELD_REGEN   = 150;
 const RADAR_RANGE    = 2200;
+
+// ── Types de vaisseaux ─────────────────────────────────────────────────────
+const TYPE1_BURST   = 3;    // type 1 : triple rafale distinctive
+const TYPE2_HP      = 10;   // type 2 : HP propres
+const TYPE2_SHIELD  = 0;    // type 2 : pas de bouclier
+const TYPE2_BULLET_SPD = 5.5; // type 2 : même vitesse de balle que type 1
+const TYPE2_HOME    = 0.13; // type 2 : guidage magnétique (spécificité)
+const TYPE2_SPEED   = 1;    // type 2 : même vitesse que type 1
+const TYPE2_THRUST  = 1;
+const TYPE2_ANG     = 1;    // même maniabilité que type 1
+const TYPE3_LASER_LIFE = 62; // type 3 : durée laser (≈1 sec)
+const TYPE3_LASER_DMG_CD = 14; // type 3 : cadence dégâts laser (frames)
+const TYPE3_HP      = 560;  // type 3 : ULTRA résistant (×20)
+const TYPE3_SHIELD  = 14;
+const TYPE3_RADIUS  = 32;   // plus gros
+const TYPE3_SPDDMLT = 0.32; // beaucoup plus lent
+const TYPE3_THRST   = 0.28;
+const TYPE3_ANGMLT  = 0.38;
+const TYPE3_CD      = 75;   // cadence de tir plus lente
+const TYPE3_FWDBLK  = Math.PI/2.2; // arc avant bloqué (~82°)
 
 // ── Planète centrale ──────────────────────────────────────────────────────
 const PLANET = {x:0, y:0, r:300, gravR:1400, G:0.055};
@@ -357,12 +385,15 @@ const ship = {
   burstLeft:0, burstTimer:0, fireTimer:0, burstTarget:null,
   dead:false, respawnTimer:0, immuneTimer:0,
   name:'JOUEUR', empTimer:0, speedBoost:0,
+  shipType:1, radius:SHIP_RADIUS, maxHp:PLAYER_HP, maxShield:SHIELD_MAX,
+  speedMult:1, thrustMult:1, angMult:1, burstSz:TYPE1_BURST,
 };
 const keys = { left:false, right:false };
 // ── Caméra & mode spectateur ──────────────────────────────────────────────
 let _camX=0, _camY=0;
 let spectMode=false, spectIdx=0, _spectTarget=null, spectAutoDeath=false;
 canvas.addEventListener('contextmenu', e => e.preventDefault());
+
 window.addEventListener('keydown', e=>{
   if(e.key==='v'||e.key==='V'){
     spectMode=!spectMode; spectIdx=0; spectAutoDeath=false;
@@ -538,37 +569,40 @@ function updateAsteroids(){
 }
 
 // ── Spawns ────────────────────────────────────────────────────────────────
-// Spawns rouges en formation sablier (horizontal) – pointe vers les bleus
-const _RED_SP=[
-  {x:-5500, y:-2500},{x:-3000, y:-2800},   // aile gauche haut
-  {x:-5500, y:-5800},{x:-3000, y:-5200},   // aile gauche bas
-  {x: -800, y:-4000},{x:  800, y:-4000},   // étranglement central
-  {x: 3000, y:-2800},{x: 5500, y:-2500},   // aile droite haut
-  {x: 3000, y:-5200},{x: 5500, y:-5800},   // aile droite bas
-];
+// Toutes les stations démarrent neutres — spawn uniquement sur les T3
+function mkSpawn(x,y){
+  return{x,y,team:'neutral',progress:0,capTeam:null,
+    turretHp:3,turretMaxHp:3,turretRespawnTimer:0,
+    turretAngle:Math.random()*Math.PI*2,turretFireTimer:60+Math.floor(Math.random()*90)};
+}
 const spawns=[];
-for(const p of _RED_SP)
-  spawns.push({x:p.x+(Math.random()-0.5)*280, y:p.y+(Math.random()-0.5)*280, team:'red',  progress:0, capTeam:null});
-for(let i=0;i<10;i++){
-  let bx=-6400+i*(12800/9)+(Math.random()-0.5)*400;
-  let by=2800+Math.random()*3000;
-  // Clamper dans la map circulaire (marge de 400u par rapport au bord)
-  const _bd=Math.hypot(bx,by); const _bMax=MAP_RADIUS-400;
-  if(_bd>_bMax){bx=bx/_bd*_bMax; by=by/_bd*_bMax;}
-  spawns.push({x:bx, y:by, team:'blue', progress:0, capTeam:null});
+const _ALL_SP=[
+  {x:-2200,y:6000},{x:0,y:6400},{x:2200,y:6000},
+  {x:-2200,y:-6000},{x:0,y:-6400},{x:2200,y:-6000},
+  {x:-5800,y:-1800},{x:5800,y:-1800},{x:-5800,y:1800},{x:5800,y:1800},
+  {x:-3200,y:-4800},{x:3200,y:-4800},{x:-3200,y:4800},{x:3200,y:4800},
+  {x:0,y:-3800},{x:0,y:3800},{x:-6200,y:0},{x:6200,y:0},
+  {x:-2200,y:-1400},{x:2200,y:1400},
+];
+for(const p of _ALL_SP){
+  let nx=p.x+(Math.random()-0.5)*300,ny=p.y+(Math.random()-0.5)*300;
+  const nd=Math.hypot(nx,ny)||0.01,nMax=MAP_RADIUS-500;
+  if(nd>nMax){nx=nx/nd*nMax;ny=ny/nd*nMax;}
+  if(Math.hypot(nx,ny)<900){const _nf=Math.hypot(nx,ny)||0.01;nx=nx/_nf*950;ny=ny/_nf*950;}
+  spawns.push(mkSpawn(nx,ny));
 }
 
 // ── État de partie ────────────────────────────────────────────────────────
-const teamLives={blue:TEAM_LIVES, red:2000};
-const initialLives={blue:TEAM_LIVES, red:2000};
+const teamLives={blue:1000, red:1000};
+const initialLives={blue:1000, red:1000};
 let gameOver=null;
-let _playerLives=3; // Vies joueur (style arcade)
+let _playerLives=Infinity; // Pas de limite de vies joueur
 let _score=0, _kills=0, _caps=0;
+const playerShipType=1; // toujours type 1
 const _hiKey='pewpew_hiscore';
 let _highScore=parseInt(localStorage.getItem(_hiKey)||'0');
 let _playerGameOver=false; // true quand les 3 vies sont épuisées
-// Positionnement initial du joueur sur un spawn bleu
-{const sp=spawns.filter(s=>s.team==='blue')[Math.floor(Math.random()*10)];ship.x=sp.x+(Math.random()-0.5)*80;ship.y=sp.y+(Math.random()-0.5)*80;}
+// Positionnement initial du joueur : défini après blues (voir après assignT3Escorts)
 
 // ── Noms & journal ────────────────────────────────────────────────────────
 const _NAMES=['Vega','Orion','Nova','Lyra','Draco','Sirius','Atlas','Ceres',
@@ -590,41 +624,89 @@ function addLog(parts){
 
 
 // ── Vaisseaux IA ──────────────────────────────────────────────────────────
-function mkAI(team){
+// Positions de départ dispersées pour les T3 (4 par équipe)
+const T3_BLUE_STARTS=[
+  {x:-3800,y:5200},{x:3800,y:5200},{x:-1800,y:3200},{x:1800,y:3200}
+];
+const T3_RED_STARTS=[
+  {x:-3800,y:-5200},{x:3800,y:-5200},{x:-1800,y:-3200},{x:1800,y:-3200}
+];
+function mkAI(team,shipType=1,startPos=null){
   const fr=spawns.filter(s=>s.team===team);
-  const sp=fr[Math.floor(Math.random()*fr.length)];
-  const ms=team==='red'?RED_SHIELD_MAX:SHIELD_MAX;
+  // Si pas de spawn capturé : répartir les vaisseaux autour des positions T3
+  const _t3bases=team==='blue'?T3_BLUE_STARTS:T3_RED_STARTS;
+  const _fbk=_t3bases[Math.floor(Math.random()*_t3bases.length)];
+  const sp=startPos??(fr.length?fr[Math.floor(Math.random()*fr.length)]:_fbk);
+  const isT3=shipType===3;
+  const ms=isT3?TYPE3_SHIELD:(shipType===2?TYPE2_SHIELD:SHIELD_MAX);
+  const hp=isT3?TYPE3_HP:(shipType===2?TYPE2_HP:AI_HP);
+  const radius=isT3?TYPE3_RADIUS:SHIP_RADIUS;
+  const speedMult=shipType===2?TYPE2_SPEED:isT3?TYPE3_SPDDMLT:1;
+  const thrustMult=shipType===2?TYPE2_THRUST:isT3?TYPE3_THRST:1;
+  const angMult=shipType===2?TYPE2_ANG:isT3?TYPE3_ANGMLT:1;
+  const burstSz=shipType===1?TYPE1_BURST:BURST_SIZE;
   return {
     x:sp.x+(Math.random()-0.5)*120, y:sp.y+(Math.random()-0.5)*120,
     vx:0, vy:0, angle:Math.random()*Math.PI*2, angVel:0,
-    team, hp:(team==='red'?RED_AI_HP:AI_HP),
+    team, hp, shipType, radius,
+    speedMult, thrustMult, angMult, burstSz,
     shield:ms, maxShield:ms, shieldTimer:0, shieldHit:0,
     burstLeft:0, burstTimer:0, burstTarget:null,
     fireTimer:BURST_CD+Math.floor(Math.random()*80),
     dead:false, respawnTimer:0, hit:0, immuneTimer:0,
+    patrolX:(Math.random()-0.5)*10000, patrolY:(Math.random()-0.5)*10000, patrolTimer:0,
     strafeDir:Math.sign(Math.random()-0.5),
     strafeTimer:20+Math.floor(Math.random()*90),
     disengageTimer:0,
     name:nextName(),
-    maxHp:(team==='red'?RED_AI_HP:AI_HP),
+    maxHp:hp,
     empTimer:0, speedBoost:0,
+    rallyTarget:null, rallyTimer:0,
   };
 }
-const blues=Array.from({length:29},()=>mkAI('blue'));
-const reds =Array.from({length:60},()=>mkAI('red'));
+const blues=[
+  ...Array.from({length:20},()=>mkAI('blue',1)),
+  ...Array.from({length:50},()=>mkAI('blue',2)),
+  ...T3_BLUE_STARTS.map(pos=>mkAI('blue',3,pos)),
+];
+const reds=[
+  ...Array.from({length:20},()=>mkAI('red',1)),
+  ...Array.from({length:50},()=>mkAI('red',2)),
+  ...T3_RED_STARTS.map(pos=>mkAI('red',3,pos)),
+];
 
-// ── Projectiles & particules ──────────────────────────────────────────────
-// ── Formation d'escorte ───────────────────────────────────────────────────
+// ── Formation d'escorte joueur + T3 ──────────────────────────────────────
 const FORM_SLOTS=[
   {fwd:-110,lat: 110},{fwd:-110,lat:-110},
   {fwd:  70,lat: 155},{fwd:  70,lat:-155},
 ];
+// Escorte de chaque T3 : 4 bots assignés
+const T3_ESCORT_SLOTS=[
+  {fwd:-120,lat: 120},{fwd:-120,lat:-120},
+  {fwd:  80,lat: 170},{fwd:  80,lat:-170},
+];
+function assignT3Escorts(fleet){
+  const t3ships=fleet.filter(a=>a.shipType===3);
+  const others=fleet.filter(a=>a.shipType!==3);
+  let idx=0;
+  for(const t3 of t3ships){
+    for(let slot=0;slot<4&&idx<others.length;slot++,idx++){
+      others[idx].escortOf=t3; others[idx].escortSlot=slot;
+    }
+  }
+}
+assignT3Escorts(blues); assignT3Escorts(reds);
+// Position initiale du joueur : T3 bleu vivant, sinon fallback sud
+{const _t3src=blues.filter(a=>!a.dead&&a.shipType===3);
+const _bsrc=_t3src.length?_t3src:[{x:0,y:6000}];
+const sp=_bsrc[Math.floor(Math.random()*_bsrc.length)];
+ship.x=sp.x+(Math.random()-0.5)*200;ship.y=sp.y+(Math.random()-0.5)*200;}
 let formationTimer=480+Math.floor(Math.random()*480);
 let formationActive=false, formationNotif=0, formationFillTimer=0;
 
 function triggerFormation(){
   if(ship.dead) return;
-  const alive=blues.filter(a=>!a.dead&&Math.hypot(a.x-ship.x,a.y-ship.y)<2200);
+  const alive=blues.filter(a=>!a.dead&&a.shipType!==3&&Math.hypot(a.x-ship.x,a.y-ship.y)<2200);
   if(alive.length<2) return;
   alive.sort((a,b)=>Math.hypot(a.x-ship.x,a.y-ship.y)-Math.hypot(b.x-ship.x,b.y-ship.y));
   const count=Math.min(alive.length,FORM_SLOTS.length);
@@ -648,7 +730,8 @@ function getSlotPos(slot){
   };
 }
 
-const bullets=[], particles=[], pickups=[], playerFeedback=[];
+const bullets=[], particles=[], pickups=[], playerFeedback=[], lasers=[];
+const MAX_LASERS=32;
 function addExplosion(x,y,team){
   const col=team==='blue'?[80,160,255]:[255,80,60];
   for(let i=0;i<16;i++){
@@ -677,7 +760,8 @@ function addSpark(x,y,team){
 // ── Physique ──────────────────────────────────────────────────────────────
 function applyPhysics(obj,simL,simR){
   const boost=obj.speedBoost>0?1.45:1;
-  const thrust=THRUST_FWD*boost, maxSpd=MAX_SPEED*boost;
+  const _spm=obj.speedMult||1, _thm=obj.thrustMult||1, _anm=obj.angMult||1;
+  const thrust=THRUST_FWD*boost*_thm, maxSpd=MAX_SPEED*boost*_spm;
   const fwd=Math.cos(obj.angle), fup=Math.sin(obj.angle);
   // ── Zones EMP : coupure continue + répulsion magnétique ──────────────────
   let empBlocked=false;
@@ -686,15 +770,15 @@ function applyPhysics(obj,simL,simR){
     if(d<ez.r){
       empBlocked=true;
       // Poussée magnétique douce vers l'extérieur
-      obj.vx+=(obj.x-ez.x)/d*0.025;
-      obj.vy+=(obj.y-ez.y)/d*0.025;
+      obj.vx+=(obj.x-ez.x)/d*0.06;
+      obj.vy+=(obj.y-ez.y)/d*0.06;
     }
   }
   obj.empTimer=empBlocked?1:0; // pour le HUD uniquement
   if(!empBlocked){
     if(simL&&simR){obj.vx+=fwd*thrust; obj.vy+=fup*thrust;}
-    else if(simL){obj.angVel+=THRUST_ANG; obj.vx+=fwd*thrust*0.35; obj.vy+=fup*thrust*0.35;}
-    else if(simR){obj.angVel-=THRUST_ANG; obj.vx+=fwd*thrust*0.35; obj.vy+=fup*thrust*0.35;}
+    else if(simL){obj.angVel+=THRUST_ANG*_anm; obj.vx+=fwd*thrust*0.35; obj.vy+=fup*thrust*0.35;}
+    else if(simR){obj.angVel-=THRUST_ANG*_anm; obj.vx+=fwd*thrust*0.35; obj.vy+=fup*thrust*0.35;}
   }
   const spd=Math.hypot(obj.vx,obj.vy);
   if(spd>maxSpd){obj.vx=obj.vx/spd*maxSpd; obj.vy=obj.vy/spd*maxSpd;}
@@ -705,7 +789,7 @@ function applyPhysics(obj,simL,simR){
 function asteroidBounce(obj,nearby){
   for(const a of nearby){
     const dx=obj.x-a.wx, dy=obj.y-a.wy, dist=Math.hypot(dx,dy);
-    const minD=SHIP_RADIUS+a.radius*0.72;
+    const minD=(obj.radius||SHIP_RADIUS)+a.radius*0.72;
     if(dist<minD&&dist>0.1){
       const nx=dx/dist, ny=dy/dist;
       obj.x+=nx*(minD-dist); obj.y+=ny*(minD-dist);
@@ -752,7 +836,7 @@ function asteroidBounce(obj,nearby){
 }
 function wallBounce(obj){
   const dist=Math.hypot(obj.x,obj.y)||0.01;
-  const R=MAP_RADIUS-SHIP_RADIUS;
+  const R=MAP_RADIUS-(obj.radius||SHIP_RADIUS);
   if(dist>=R){
     // Rebond dur sur la frontière circulaire
     const nx=obj.x/dist, ny=obj.y/dist;
@@ -774,7 +858,7 @@ function tickShield(obj){
   if(obj.immuneTimer>0) obj.immuneTimer--;
   if(obj.shieldHit>0) obj.shieldHit--;
   if(obj.shieldTimer>0){
-    const sMax=obj.maxShield||SHIELD_MAX;
+    const sMax=obj.maxShield??SHIELD_MAX;
     if(--obj.shieldTimer===0 && obj.shield<sMax){
       obj.shield++;
       if(obj.shield<sMax) obj.shieldTimer=SHIELD_REGEN;
@@ -794,28 +878,42 @@ function takeHit(obj){
 // ── Capture ───────────────────────────────────────────────────────────────
 function updateCaptures(){
   for(const sp of spawns){
-    const atk = sp.team==='red' ? [...blues,ship] : reds;
-    const def = sp.team==='red' ? reds : [...blues,ship];
-    const atkN=atk.filter(a=>!a.dead&&Math.hypot(a.x-sp.x,a.y-sp.y)<SPAWN_RADIUS).length;
-    const defN=def.filter(a=>!a.dead&&Math.hypot(a.x-sp.x,a.y-sp.y)<SPAWN_RADIUS).length;
-    sp.capTeam=atkN>0?(sp.team==='red'?'blue':'red'):null;
-    if(atkN>0&&defN===0){
-      // Les rouges capturent plus lentement (0.35×)
-      const capRate = sp.capTeam==='red' ? atkN*0.35 : atkN;
+    const blueShips=[...blues,ship],redShips=reds;
+    let atkTeam=null,atkN=0,defN=0;
+    if(sp.team==='blue'){
+      atkN=redShips.filter(a=>!a.dead&&Math.hypot(a.x-sp.x,a.y-sp.y)<SPAWN_RADIUS).length;
+      defN=blueShips.filter(a=>!a.dead&&Math.hypot(a.x-sp.x,a.y-sp.y)<SPAWN_RADIUS).length;
+      if(atkN>0) atkTeam='red';
+    } else if(sp.team==='red'){
+      atkN=blueShips.filter(a=>!a.dead&&Math.hypot(a.x-sp.x,a.y-sp.y)<SPAWN_RADIUS).length;
+      defN=redShips.filter(a=>!a.dead&&Math.hypot(a.x-sp.x,a.y-sp.y)<SPAWN_RADIUS).length;
+      if(atkN>0) atkTeam='blue';
+    } else { // neutral
+      const bN=blueShips.filter(a=>!a.dead&&Math.hypot(a.x-sp.x,a.y-sp.y)<SPAWN_RADIUS).length;
+      const rN=redShips.filter(a=>!a.dead&&Math.hypot(a.x-sp.x,a.y-sp.y)<SPAWN_RADIUS).length;
+      if(bN>0&&rN===0){atkN=bN;atkTeam='blue';}
+      else if(rN>0&&bN===0){atkN=rN;atkTeam='red';}
+      else if(bN>0&&rN>0){sp.progress=Math.max(0,sp.progress-0.5);sp.capTeam=null;continue;}
+      defN=0;
+    }
+    sp.capTeam=atkTeam;
+    if(atkTeam&&atkN>0&&defN===0){
+      const capRate=atkTeam==='red'?atkN*0.35:atkN;
       sp.progress+=capRate;
       if(sp.progress>=CAPTURE_FRAMES){
-        const newTeam=sp.team==='red'?'blue':'red';
-        // Trouver le capteur le plus proche
+        const newTeam=atkTeam;
         const cappers=(newTeam==='blue'?[...blues,ship]:reds).filter(a=>!a.dead&&Math.hypot(a.x-sp.x,a.y-sp.y)<SPAWN_RADIUS);
         const capper=cappers.length?cappers[0]:null;
         const capName=capper?(capper===ship?'JOUEUR':capper.name):'?';
         const capTeam=capper?(capper===ship?'blue':capper.team):'blue';
         addLog([{text:capName,col:teamCol(capTeam)},{text:' ⬡ spawn ',col:'#888'},{text:newTeam==='blue'?'bleu':'rouge',col:teamCol(newTeam)}]);
-        sp.team=newTeam;sp.progress=0;sp.capTeam=null; playSound('capture',0.55);
-        if(capper===ship){ _score+=200; _caps++; }
+        sp.team=newTeam;sp.progress=0;sp.capTeam=null;playSound('capture',0.55);
+        if(capper===ship){_score+=200;_caps++;}
       }
     } else if(defN>0&&atkN===0&&sp.progress>0){
       sp.progress=Math.max(0,sp.progress-0.5);
+    } else if(!atkTeam&&sp.progress>0){
+      sp.progress=Math.max(0,sp.progress-0.3);
     }
   }
 }
@@ -824,16 +922,20 @@ function updateCaptures(){
 function updateAI(ai,enemies){
   if(ai.dead){
     if(--ai.respawnTimer<=0){
-      const fr=spawns.filter(s=>s.team===ai.team);
-      if(!fr.length) return; // plus de spawn contrôlé
-      // Spawn bloqué si tickets épuisés ou nb vivants >= tickets restants
+      // Type 3 : jamais de respawn
+      if(ai.shipType===3) return;
+      // Spawn uniquement sur les T3 alliés vivants
+      const t3sp=(ai.team==='blue'?blues:reds).filter(a=>!a.dead&&a.shipType===3);
+      const spawnStations=spawns.filter(s=>s.team===ai.team);
+      const allSpawnPts=[...t3sp.map(a=>({x:a.x,y:a.y})),...spawnStations];
+      if(!allSpawnPts.length) return;
       const aliveN=(ai.team==='blue'?blues.filter(a=>!a.dead).length+(ship.dead?0:1):reds.filter(a=>!a.dead).length);
       if(teamLives[ai.team]<=0||teamLives[ai.team]<=aliveN) return;
-      const sp=fr[Math.floor(Math.random()*fr.length)];
+      const sp=allSpawnPts[Math.floor(Math.random()*allSpawnPts.length)];
       ai.x=sp.x+(Math.random()-0.5)*120; ai.y=sp.y+(Math.random()-0.5)*120;
       ai.vx=ai.vy=ai.angVel=0; ai.angle=Math.random()*Math.PI*2;
-      ai.hp=(ai.team==='red'?RED_AI_HP:AI_HP); ai.dead=false; ai.burstLeft=0; ai.burstTarget=null;
-      ai.shield=ai.maxShield||SHIELD_MAX; ai.shieldTimer=0; ai.shieldHit=0; ai.immuneTimer=SPAWN_IMMUNE;
+      ai.hp=ai.maxHp; ai.dead=false; ai.burstLeft=0; ai.burstTarget=null;
+      ai.shield=ai.maxShield??SHIELD_MAX; ai.shieldTimer=0; ai.shieldHit=0; ai.immuneTimer=SPAWN_IMMUNE;
       ai.formSlot=undefined;
       ai.fireTimer=BURST_CD+Math.floor(Math.random()*80);
       ai.strafeDir=Math.sign(Math.random()-0.5);
@@ -857,7 +959,7 @@ function updateAI(ai,enemies){
   for(const s of eSpawns){const d=Math.hypot(s.x-ai.x,s.y-ai.y);if(d<sDist){sDist=d;spTgt=s;}}
   // Pickup le plus proche si blessé
   let pkTgt=null, pkDist=Infinity;
-  if(ai.hp<AI_HP){for(const pk of pickups){const d=Math.hypot(pk.x-ai.x,pk.y-ai.y);if(d<1400&&d<pkDist){pkDist=d;pkTgt=pk;}}}
+  if(ai.hp<ai.maxHp){for(const pk of pickups){const d=Math.hypot(pk.x-ai.x,pk.y-ai.y);if(d<1400&&d<pkDist){pkDist=d;pkTgt=pk;}}}
 
   const lx=ai.x+ai.vx*28, ly=ai.y+ai.vy*28;
   let repX=0, repY=0;
@@ -903,9 +1005,11 @@ function updateAI(ai,enemies){
     const d2=Math.hypot(lx-PLANET.x,ly-PLANET.y)||0.01;
     const d=Math.min(d1,d2);
     const px2=d1<d2?ai.x:lx, py2=d1<d2?ai.y:ly;
-    const pDanger=PLANET.r+440;
+    // T3 tourne beaucoup plus lentement → zone de danger plus grande
+    const pDanger=PLANET.r+(ai.shipType===3?900:440);
+    const pStr=ai.shipType===3?28:14;
     if(d<pDanger){
-      const str=Math.pow((pDanger-d)/pDanger,1.4)*14;
+      const str=Math.pow((pDanger-d)/pDanger,1.2)*pStr;
       repX+=(px2-PLANET.x)/d*str; repY+=(py2-PLANET.y)/d*str;
     }
   }
@@ -935,7 +1039,10 @@ function updateAI(ai,enemies){
 
   // Formation d'escorte autour du joueur (bleus)
   let wantForm=false;
-  if(ai.formSlot!==undefined&&ai.team==='blue'&&!ship.dead) wantForm=true;
+  if(ai.formSlot!==undefined&&ai.team==='blue'&&!ship.dead&&ai.shipType!==3) wantForm=true;
+  // Escorte T3 (toute équipe, actif uniquement si T3 vivant et pas de formSlot joueur)
+  const _t3leader=ai.escortOf&&!ai.escortOf.dead?ai.escortOf:null;
+  const wantEscort=_t3leader&&!wantForm&&ai.shipType!==3;
 
   let desAngle=ai.angle;
   if(repStr>1){desAngle=Math.atan2(repY,repX);}
@@ -950,6 +1057,13 @@ function updateAI(ai,enemies){
     }
   }
   else if(wantPickup){desAngle=Math.atan2(pkTgt.y-ai.y,pkTgt.x-ai.x);}
+  else if(wantEscort&&!target){
+    const _slot=T3_ESCORT_SLOTS[ai.escortSlot];
+    const _cosL=Math.cos(_t3leader.angle),_sinL=Math.sin(_t3leader.angle);
+    const _tx=_t3leader.x+_cosL*_slot.fwd-_sinL*_slot.lat;
+    const _ty=_t3leader.y+_sinL*_slot.fwd+_cosL*_slot.lat;
+    desAngle=Math.atan2(_ty-ai.y,_tx-ai.x);
+  }
   else if(wantCap){
     // En zone de capture ET ennemi à portée : viser l'ennemi tout en capturant
     if(spTgt&&Math.hypot(ai.x-spTgt.x,ai.y-spTgt.y)<SPAWN_RADIUS&&target&&tDist<FIRE_RANGE){
@@ -961,13 +1075,72 @@ function updateAI(ai,enemies){
   }
   else if(target){
     const t=Math.min(tDist/BULLET_SPEED,45);
-    desAngle=Math.atan2(target.y+target.vy*t-ai.y,target.x+target.vx*t-ai.x);
-    if(repStr>0.2){
-      const blend=Math.min(repStr,1)*0.42, rs=repStr||1;
-      desAngle=Math.atan2(Math.sin(desAngle)*(1-blend)+repY/rs*blend,Math.cos(desAngle)*(1-blend)+repX/rs*blend);
+    const _tgtAngle=Math.atan2(target.y+target.vy*t-ai.y,target.x+target.vx*t-ai.x);
+    if(ai.shipType===3){
+      // Type 3 : orient flank toward enemy
+      const _o1=_tgtAngle+Math.PI/2, _o2=_tgtAngle-Math.PI/2;
+      let _d1=_o1-ai.angle; while(_d1>Math.PI)_d1-=Math.PI*2; while(_d1<-Math.PI)_d1+=Math.PI*2;
+      let _d2=_o2-ai.angle; while(_d2>Math.PI)_d2-=Math.PI*2; while(_d2<-Math.PI)_d2+=Math.PI*2;
+      desAngle=Math.abs(_d1)<Math.abs(_d2)?_o1:_o2;
+    } else {
+      desAngle=_tgtAngle;
+      if(repStr>0.2){
+        const blend=Math.min(repStr,1)*0.42, rs=repStr||1;
+        desAngle=Math.atan2(Math.sin(desAngle)*(1-blend)+repY/rs*blend,Math.cos(desAngle)*(1-blend)+repX/rs*blend);
+      }
     }
   }
 
+  // ── Rally : converger vers la cible T3 désignée ──────────────────────────
+  if(ai.rallyTarget){
+    if(ai.rallyTarget.dead||ai.rallyTimer<=0){ ai.rallyTarget=null; ai.rallyTimer=0; }
+    else {
+      ai.rallyTimer--;
+      if(!target){ // seulement si pas d'ennemi immédiat
+        const _rDist=Math.hypot(ai.rallyTarget.x-ai.x,ai.rallyTarget.y-ai.y);
+        if(_rDist<500){ ai.rallyTarget=null; ai.rallyTimer=0; } // arrivé sur zone
+        else { desAngle=Math.atan2(ai.rallyTarget.y-ai.y,ai.rallyTarget.x-ai.x); }
+      }
+    }
+  }
+  // ── Patrouille : dispersion sur la map quand pas d'objectif ───────────────
+  const _idle=!target&&!wantCap&&!wantPickup&&!wantForm&&repStr<0.5&&!ai.rallyTarget;
+  if(_idle){
+    const _pd=Math.hypot(ai.x-ai.patrolX,ai.y-ai.patrolY);
+    if(_pd<350||--ai.patrolTimer<=0){
+      if(ai.shipType===3&&eSpawns.length){
+        // Type 3 : fonce vers un spawn ennemi, en évitant la planète
+        const _eS=eSpawns[Math.floor(Math.random()*eSpawns.length)];
+        let _px=_eS.x+(Math.random()-0.5)*900, _py=_eS.y+(Math.random()-0.5)*900;
+        // Si la cible est trop proche de la planète, la décaler latéralement
+        const _ptPlanetD=Math.hypot(_px-PLANET.x,_py-PLANET.y);
+        if(_ptPlanetD<PLANET.r+800){
+          const _pa=Math.atan2(_py-PLANET.y,_px-PLANET.x);
+          const _side=(Math.random()<0.5?1:-1)*Math.PI*0.55;
+          _px=PLANET.x+Math.cos(_pa+_side)*(PLANET.r+900);
+          _py=PLANET.y+Math.sin(_pa+_side)*(PLANET.r+900);
+        }
+        ai.patrolX=_px; ai.patrolY=_py;
+        ai.patrolTimer=480+Math.floor(Math.random()*200);
+      } else {
+        // Nouveau waypoint : aléatoire mais éloigné des coéquipiers proches
+        let _bx=0,_by=0,_best=-1;
+        for(let _pi=0;_pi<6;_pi++){
+          const _ang=Math.random()*Math.PI*2, _dist=2500+Math.random()*4500;
+          const _cx=ai.x+Math.cos(_ang)*_dist, _cy=ai.y+Math.sin(_ang)*_dist;
+          const _cl=Math.min(Math.abs(_cx),Math.abs(_cy));
+          if(_cl>MAP_HALF*0.95) continue; // hors map
+          let _minF=Infinity;
+          for(const _f of teammates){if(_f===ai||_f.dead)continue;_minF=Math.min(_minF,Math.hypot(_cx-_f.x,_cy-_f.y));}
+          if(_minF===Infinity) _minF=9999;
+          if(_minF>_best){_best=_minF;_bx=_cx;_by=_cy;}
+        }
+        ai.patrolX=_bx||ai.patrolX; ai.patrolY=_by||ai.patrolY;
+        ai.patrolTimer=360+Math.floor(Math.random()*240);
+      }
+    }
+    desAngle=Math.atan2(ai.patrolY-ai.y,ai.patrolX-ai.x);
+  }
   if(--ai.strafeTimer<=0){ai.strafeDir*=-1;ai.strafeTimer=75+Math.floor(Math.random()*80);}
 
   // ── Désengagement : s'éloigner avant de revenir ───────────────────────
@@ -976,7 +1149,7 @@ function updateAI(ai,enemies){
     ai.disengageTimer--;
     // Voler à l'opposé de la cible (pas de strafe, pas de circling)
     if(target&&repStr<0.8) desAngle=Math.atan2(ai.y-target.y, ai.x-target.x);
-  } else if(target&&tDist<DISENGAGE_DIST&&repStr<0.8&&!wantCap&&!wantForm){
+  } else if(target&&tDist<DISENGAGE_DIST&&repStr<0.8&&!wantCap&&!wantForm&&ai.shipType!==3){
     // Trop proche → déclencher la fuite
     ai.disengageTimer=75+Math.floor(Math.random()*55);
   }
@@ -993,7 +1166,7 @@ function updateAI(ai,enemies){
   const simL=corr>0.07, simR=corr<-0.07;
 
   let simFwd=true;
-  if(!disengaging&&repStr<1&&target&&!wantCap){
+  if(!disengaging&&repStr<1&&target&&!wantCap&&ai.shipType!==3){
     const approach=(ai.vx*(target.x-ai.x)+ai.vy*(target.y-ai.y))/tDist;
     if(tDist<ENGAGE_DIST*0.35&&approach>3.5) simFwd=false;
   }
@@ -1009,12 +1182,13 @@ function updateAI(ai,enemies){
       ai.vy+=(ai.y-ez.y)/d*0.09;
     }
   }
+  const _thrMult=ai.thrustMult||1, _angMult=ai.angMult||1;
   if(!aiEmpBlocked){
-    if(simL&&!simR){ai.angVel+=THRUST_ANG;if(simFwd){ai.vx+=fwd*THRUST_FWD*0.35;ai.vy+=fup*THRUST_FWD*0.35;}}
-    else if(simR&&!simL){ai.angVel-=THRUST_ANG;if(simFwd){ai.vx+=fwd*THRUST_FWD*0.35;ai.vy+=fup*THRUST_FWD*0.35;}}
-    else if(simFwd){ai.vx+=fwd*THRUST_FWD;ai.vy+=fup*THRUST_FWD;}
+    if(simL&&!simR){ai.angVel+=THRUST_ANG*_angMult;if(simFwd){ai.vx+=fwd*THRUST_FWD*_thrMult*0.35;ai.vy+=fup*THRUST_FWD*_thrMult*0.35;}}
+    else if(simR&&!simL){ai.angVel-=THRUST_ANG*_angMult;if(simFwd){ai.vx+=fwd*THRUST_FWD*_thrMult*0.35;ai.vy+=fup*THRUST_FWD*_thrMult*0.35;}}
+    else if(simFwd){ai.vx+=fwd*THRUST_FWD*_thrMult;ai.vy+=fup*THRUST_FWD*_thrMult;}
   }
-  const _aiMaxSpd=MAX_SPEED*(ai.speedBoost>0?1.45:1);
+  const _aiMaxSpd=MAX_SPEED*(ai.speedMult||1)*(ai.speedBoost>0?1.45:1);
   const spd=Math.hypot(ai.vx,ai.vy);
   if(spd>_aiMaxSpd){ai.vx=ai.vx/spd*_aiMaxSpd;ai.vy=ai.vy/spd*_aiMaxSpd;}
   if(ai.speedBoost>0) ai.speedBoost--;
@@ -1025,9 +1199,36 @@ function updateAI(ai,enemies){
 
   if(ai.burstLeft>0){
     if(--ai.burstTimer<=0){
-      if(bullets.length<MAX_BULLETS){
-        bullets.push({x:ai.x,y:ai.y,vx:Math.cos(ai.angle)*BULLET_SPEED+ai.vx*0.25,vy:Math.sin(ai.angle)*BULLET_SPEED+ai.vy*0.25,team:ai.team,life:BULLET_LIFE,target:ai.burstTarget,shooter:ai,wx:ai.x,wy:ai.y});
-        sfxShoot(ai.x,ai.y);
+      if(ai.shipType===3){
+        // Type 3 : 2 lasers latéraux (gauche + droite) ciblant indépendamment
+        const foes=ai.team==='blue'?[...reds]:[...blues,ship];
+        const _lfw2=Math.cos(ai.angle),_lfu2=Math.sin(ai.angle);
+        const _llx2=-_lfu2,_lly2=_lfw2;
+        for(const _side of ['left','right']){
+          if(lasers.length>=MAX_LASERS) break;
+          const _sign=_side==='left'?1:-1;
+          // Chercher l'ennemi le plus proche de ce côté
+          let _stgt=null,_sd=Infinity;
+          for(const f of foes){
+            if(f.dead) continue;
+            const _dot=(f.x-ai.x)*_llx2*_sign+(f.y-ai.y)*_lly2*_sign;
+            if(_dot<=0) continue; // mauvais côté
+            const _fd=Math.hypot(f.x-ai.x,f.y-ai.y);
+            if(_fd<_sd&&_fd<FIRE_RANGE*1.3){_sd=_fd;_stgt=f;}
+          }
+          if(_stgt){
+            lasers.push({shooter:ai,target:_stgt,team:ai.team,side:_side,
+              life:TYPE3_LASER_LIFE,maxLife:TYPE3_LASER_LIFE,dmgTimer:0,owner:null});
+            sfxShoot(ai.x,ai.y);
+          }
+        }
+      } else {
+        if(bullets.length<MAX_BULLETS){
+          const _bspd=ai.shipType===2?TYPE2_BULLET_SPD:BULLET_SPEED;
+          const _bhome=ai.shipType===2;
+          bullets.push({x:ai.x,y:ai.y,vx:Math.cos(ai.angle)*_bspd+ai.vx*0.25,vy:Math.sin(ai.angle)*_bspd+ai.vy*0.25,team:ai.team,life:BULLET_LIFE,target:ai.burstTarget,shooter:ai,wx:ai.x,wy:ai.y,homing:_bhome});
+          sfxShoot(ai.x,ai.y);
+        }
       }
       ai.burstLeft--; ai.burstTimer=BURST_DELAY;
     }
@@ -1039,16 +1240,56 @@ function updateAI(ai,enemies){
     // Avantage caché : imprécision + cooldown allongé quand un rouge vise le joueur
     const vsPlayer=ai.team==='red'&&target===ship;
     const aimNoise=vsPlayer?(Math.random()-0.5)*0.09:0;
-    // Rouges : pénalité CD vs joueur / Bleus : quasi pas de CD (tir en continu)
-    const cdBonus=vsPlayer?35:(ai.team==='blue'?-(BURST_CD+35):0);
-    if(ai.fireTimer<=0&&tDist<FIRE_RANGE&&Math.abs(fd+aimNoise)<0.22&&repStr<1){
-      ai.burstLeft=BURST_SIZE; ai.burstTimer=1; ai.fireTimer=Math.max(ai.team==='blue'?16:8,BURST_CD+cdBonus+Math.floor(Math.random()*12));
+    // Légère pénalité CD vs joueur pour les deux équipes
+    const cdBonus=vsPlayer?20:-(BURST_CD+35);
+    if(ai.shipType===3){
+      // Type 3 : tir uniquement si ennemi PAS dans l'arc avant
+      if(ai.fireTimer<=0&&tDist<FIRE_RANGE*1.2&&Math.abs(fd)>TYPE3_FWDBLK&&repStr<1){
+        ai.burstLeft=1; ai.burstTimer=1; ai.fireTimer=TYPE3_CD+Math.floor(Math.random()*25);
+        ai.burstTarget=target;
+      }
+    } else if(ai.fireTimer<=0&&tDist<FIRE_RANGE&&Math.abs(fd+aimNoise)<0.22&&repStr<1){
+      ai.burstLeft=ai.burstSz||BURST_SIZE; ai.burstTimer=1; ai.fireTimer=Math.max(16,BURST_CD+cdBonus+Math.floor(Math.random()*12));
       ai.burstTarget=target;
     }
   }
 }
 
 // ── Systèmes de jeu dynamiques ───────────────────────────────────────────
+function updateSpawnTurrets(){
+  const TURRET_RANGE=680;
+  for(const sp of spawns){
+    if(sp.turretHp<=0){
+      if(--sp.turretRespawnTimer<=0){sp.turretHp=sp.turretMaxHp;sp.turretFireTimer=60;}
+      continue;
+    }
+    if(sp.team==='neutral') continue; // tourelle inactive si station neutre
+    const foes=sp.team==='blue'?[...reds]:[...blues,ship];
+    let nearest=null,nearDist=TURRET_RANGE;
+    for(const f of foes){
+      if(f.dead) continue;
+      const d=Math.hypot(f.x-sp.x,f.y-sp.y);
+      if(d<nearDist){nearDist=d;nearest=f;}
+    }
+    if(nearest){
+      // Rotation vers la cible
+      let da=Math.atan2(nearest.y-sp.y,nearest.x-sp.x)-sp.turretAngle;
+      while(da>Math.PI)da-=Math.PI*2;while(da<-Math.PI)da+=Math.PI*2;
+      sp.turretAngle+=Math.sign(da)*Math.min(Math.abs(da),0.045);
+      // Tir
+      if(--sp.turretFireTimer<=0){
+        sp.turretFireTimer=85;
+        if(bullets.length<MAX_BULLETS){
+          bullets.push({x:sp.x+Math.cos(sp.turretAngle)*20,y:sp.y+Math.sin(sp.turretAngle)*20,
+            vx:Math.cos(sp.turretAngle)*BULLET_SPEED,vy:Math.sin(sp.turretAngle)*BULLET_SPEED,
+            team:sp.team,life:BULLET_LIFE,target:null,shooter:{name:'TOURELLE',team:sp.team},
+            wx:sp.x,wy:sp.y,homing:false});
+          sfxShoot(sp.x,sp.y);
+        }
+      }
+    }
+  }
+}
 function updateWorldSystems(){
   // ─ Zones EMP (timer visuel uniquement — coupure gérée dans la physique) ─
   for(const ez of EMP_ZONES) ez.t++;
@@ -1133,7 +1374,7 @@ function updateWorldSystems(){
     for(const s of all){
       if(s.dead||s.immuneTimer>0||m.hitCooldown>0) continue;
       const dist=Math.hypot(m.x-s.x,m.y-s.y)||0.01;
-      if(dist<m.r+SHIP_RADIUS){
+      if(dist<m.r+(s.radius||SHIP_RADIUS)){
         const nx=(s.x-m.x)/dist, ny=(s.y-m.y)/dist; // normal météore→vaisseau
         const relVx=m.vx-s.vx, relVy=m.vy-s.vy;
         const relV=relVx*nx+relVy*ny; // vitesse d'approche relative
@@ -1223,9 +1464,9 @@ function updateWorldSystems(){
     if(wreckLoot.life<=0){wreckLoot=null;return;}
     const all=[...blues,...reds,...(ship.dead?[]:[ship])];
     for(const s of all){
-      if(s.dead) continue;
+      if(s.dead||s.shipType===3) continue; // Type 3 : pas de loot
       if(Math.hypot(s.x-wreckLoot.x,s.y-wreckLoot.y)<SHIP_RADIUS*4){
-        if(wreckLoot.type==='shield'){s.shield=Math.min((s===ship?SHIELD_MAX:s.maxShield||SHIELD_MAX),(s.shield||0)+6);s.shieldTimer=0;}
+        if(wreckLoot.type==='shield'){s.shield=Math.min((s===ship?SHIELD_MAX:s.maxShield??SHIELD_MAX),(s.shield||0)+6);s.shieldTimer=0;}
         else {s.speedBoost=900;}
         const col=wreckLoot.type==='shield'?'#44aaff':'#ffaa22';
         for(let p=0;p<16;p++){const a=Math.random()*Math.PI*2,sp=1+Math.random()*3;particles.push({x:s.x,y:s.y,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp,life:35,maxLife:35,r:2+Math.random()*2,col:wreckLoot.type==='shield'?[60,180,255]:[255,170,40]});}
@@ -1243,15 +1484,15 @@ function applyGravity(obj, isBullet){
   const dx=PLANET.x-obj.x, dy=PLANET.y-obj.y;
   const dist=Math.hypot(dx,dy)||0.01;
   if(dist>PLANET.gravR) return false;
-  const surface=PLANET.r+(isBullet?0:SHIP_RADIUS);
+  const surface=PLANET.r+(isBullet?0:(obj.radius||SHIP_RADIUS));
   if(dist<=surface){
     if(isBullet) return true; // détruire la balle
     // Rebond : pousser hors de la surface + inverser composante radiale
     const nx=dx/dist, ny=dy/dist;
     const dot=obj.vx*nx+obj.vy*ny; // vitesse d'approche vers la planète
     if(dot>0){ obj.vx-=2*dot*nx*0.6; obj.vy-=2*dot*ny*0.6; }
-    obj.x=PLANET.x-nx*(PLANET.r+SHIP_RADIUS+1);
-    obj.y=PLANET.y-ny*(PLANET.r+SHIP_RADIUS+1);
+    obj.x=PLANET.x-nx*(PLANET.r+(obj.radius||SHIP_RADIUS)+1);
+    obj.y=PLANET.y-ny*(PLANET.r+(obj.radius||SHIP_RADIUS)+1);
     // ── Dégâts de collision planétaire ──
     if(!obj.dead&&obj.immuneTimer===0&&dot>1.0){
       const dmg=dot>4.0?3:dot>2.5?2:1;
@@ -1283,18 +1524,83 @@ function applyGravity(obj, isBullet){
 // ── Update principale ─────────────────────────────────────────────────────
 function update(){
   if(gameOver) return;
+  _gameTick++;
+  // ── Marqueurs de rally (minimap) ─────────────────────────────────────────
+  for(let _ri=_rallyMarkers.length-1;_ri>=0;_ri--){_rallyMarkers[_ri].life--;if(_rallyMarkers[_ri].life<=0)_rallyMarkers.splice(_ri,1);}
+  if(_rallyNotif){_rallyNotif.life--;if(_rallyNotif.life<=0)_rallyNotif=null;}
+  // ── Ticker de rally ───────────────────────────────────────────────────────
+  if(--_rallyTimer<=0){
+    _rallyTimer=7200+Math.floor(Math.random()*3600);
+    // Choisir une équipe attaquante (les deux peuvent lancer un rally)
+    const _rTeam=Math.random()<0.5?'blue':'red';
+    const _rEnemyTeam=_rTeam==='blue'?'red':'blue';
+    const _rFleet=_rTeam==='blue'?blues:reds;
+    const _rFoes=_rTeam==='blue'?reds:blues;
+    // Trouver un T3 ennemi vivant à attaquer
+    const _rT3targets=_rFoes.filter(a=>!a.dead&&a.shipType===3);
+    if(_rT3targets.length>0){
+      const _rT3=_rT3targets[Math.floor(Math.random()*_rT3targets.length)];
+      // Trouver les alliés proches (pas T3, pas escorte)
+      const _rCandidates=_rFleet.filter(a=>!a.dead&&a.shipType!==3&&Math.hypot(a.x-_rT3.x,a.y-_rT3.y)<RALLY_RANGE);
+      _rCandidates.sort(()=>Math.random()-0.5);
+      const _rAllies=_rCandidates.slice(0,RALLY_ALLY_COUNT);
+      // Caller = le plus proche du T3 parmi les alliés, ou aléatoire
+      const _rCaller=_rAllies.length>0?_rAllies[0]:{name:'Inconnu'};
+      // Assigner la cible rally à chaque allié
+      for(const _ra of _rAllies){ _ra.rallyTarget=_rT3; _ra.rallyTimer=RALLY_DURATION+Math.floor(Math.random()*200); }
+      // Notification centrale + journal
+      if(_rTeam==='blue'){
+        _rallyNotif={type:'attack',life:300,maxLife:300,lines:[
+          {text:'— RENFORT —',col:'#4aadff'},
+          {text:_rCaller.name+' : Attaque sur',col:'#aaccff'},
+          {text:'[ '+_rT3.name+' ]',col:'#ff6050'},
+        ]};
+        addLog([{text:_rCaller.name,col:'#4aadff'},{text:' → Renfort sur ',col:'#aaccff'},{text:'['+_rT3.name+']',col:'#ff6050'},{text:' !',col:'#aaccff'}]);
+        _rallyMarkers.push({t3:_rT3,team:'red',life:RALLY_DURATION,maxLife:RALLY_DURATION,type:'attack'});
+      } else {
+        _rallyNotif={type:'defend',life:300,maxLife:300,lines:[
+          {text:'— ALERTE —',col:'#ff4444'},
+          {text:'Ennemi attaque',col:'#ffaaaa'},
+          {text:'[ '+_rT3.name+' ]',col:'#4aadff'},
+        ]};
+        addLog([{text:'⚠ ATTAQUE',col:'#ff4444'},{text:' sur ',col:'#ffaaaa'},{text:'['+_rT3.name+']',col:'#4aadff'},{text:' — Renfort !',col:'#ffaaaa'}]);
+        _rallyMarkers.push({t3:_rT3,team:'blue',life:RALLY_DURATION,maxLife:RALLY_DURATION,type:'defend'});
+      }
+    }
+  }
+  // ── Revenu de tickets : 1 ticket / spawner possédé toutes les 5s ──────────
+  if(_gameTick%1200===0&&_gameTick>0){
+    for(const sp of spawns){
+      if(sp.team==='blue') teamLives.blue++;
+      else if(sp.team==='red') teamLives.red++;
+    }
+  }
   const _wasShipAlive=!ship.dead;
   if(_astSfxThrottle>0) _astSfxThrottle--;
 
   if(ship.dead){
     if(_playerLives>0&&--ship.respawnTimer<=0){
-      const fr=spawns.filter(s=>s.team==='blue');
-      const blueAlive=blues.filter(a=>!a.dead).length;
-      if(fr.length&&teamLives.blue>0&&teamLives.blue>blueAlive){
-        const sp=fr[Math.floor(Math.random()*fr.length)];
+      // Spawn joueur uniquement sur T3 bleus vivants
+      const _t3live=blues.filter(a=>!a.dead&&a.shipType===3).map(a=>({x:a.x,y:a.y}));
+      const _spStations=spawns.filter(s=>s.team==='blue');
+      const allSpawnSrc=[..._t3live,..._spStations];
+      if(allSpawnSrc.length&&teamLives.blue>0){
+        const sp=allSpawnSrc[Math.floor(Math.random()*allSpawnSrc.length)];
         ship.x=sp.x+(Math.random()-0.5)*120; ship.y=sp.y+(Math.random()-0.5)*120;
         ship.vx=ship.vy=ship.angVel=0;
-        ship.hp=PLAYER_HP; ship.shield=SHIELD_MAX; ship.shieldTimer=0; ship.shieldHit=0; ship.immuneTimer=SPAWN_IMMUNE;
+        // Appliquer les stats du type choisi
+        ship.shipType=playerShipType;
+        const _isT3p=playerShipType===3;
+        ship.maxHp  =_isT3p?TYPE3_HP:(playerShipType===2?TYPE2_HP:PLAYER_HP);
+        ship.hp     =ship.maxHp;
+        ship.maxShield=_isT3p?TYPE3_SHIELD:(playerShipType===2?TYPE2_SHIELD:SHIELD_MAX);
+        ship.shield =ship.maxShield;
+        ship.radius =_isT3p?TYPE3_RADIUS:SHIP_RADIUS;
+        ship.speedMult  =playerShipType===2?TYPE2_SPEED :_isT3p?TYPE3_SPDDMLT:1;
+        ship.thrustMult =playerShipType===2?TYPE2_THRUST:_isT3p?TYPE3_THRST   :1;
+        ship.angMult    =playerShipType===2?TYPE2_ANG   :_isT3p?TYPE3_ANGMLT  :1;
+        ship.burstSz    =playerShipType===1?TYPE1_BURST :BURST_SIZE;
+        ship.shieldTimer=0; ship.shieldHit=0; ship.immuneTimer=SPAWN_IMMUNE;
         ship.burstLeft=0; ship.fireTimer=0; ship.dead=false; playSound('respawn',0.5);
       }
     }
@@ -1323,20 +1629,42 @@ function update(){
     }
     if(ship.burstLeft>0){
       if(--ship.burstTimer<=0){
-        if(bullets.length<MAX_BULLETS){
-          bullets.push({x:ship.x,y:ship.y,vx:Math.cos(ship.angle)*BULLET_SPEED+ship.vx*0.25,vy:Math.sin(ship.angle)*BULLET_SPEED+ship.vy*0.25,team:'blue',life:BULLET_LIFE,target:ship.burstTarget,owner:'player',shooter:ship});
-          playSound('shoot',0.3);
+        if(ship.shipType===3){
+          // Cuirassé joueur : 4 lasers latéraux
+          if(ship.burstTarget&&!ship.burstTarget.dead&&lasers.length<MAX_LASERS){
+            lasers.push({shooter:ship,target:ship.burstTarget,team:'blue',
+              life:TYPE3_LASER_LIFE,maxLife:TYPE3_LASER_LIFE,dmgTimer:0,owner:'player'});
+            playSound('shoot',0.3);
+          }
+        } else {
+          if(bullets.length<MAX_BULLETS){
+            const _pbspd=(ship.shipType===2)?TYPE2_BULLET_SPD:BULLET_SPEED;
+            const _pbhome=(ship.shipType===2);
+            bullets.push({x:ship.x,y:ship.y,vx:Math.cos(ship.angle)*_pbspd+ship.vx*0.25,vy:Math.sin(ship.angle)*_pbspd+ship.vy*0.25,team:'blue',life:BULLET_LIFE,target:ship.burstTarget,owner:'player',shooter:ship,homing:_pbhome});
+            playSound('shoot',0.3);
+          }
         }
         ship.burstLeft--; ship.burstTimer=BURST_DELAY;
       }
     } else if(pTgt){
-      ship.fireTimer--;
-      const t2=Math.min(pTDist/BULLET_SPEED,45);
-      let fd=Math.atan2(pTgt.y+pTgt.vy*t2-ship.y,pTgt.x+pTgt.vx*t2-ship.x)-ship.angle;
-      while(fd>Math.PI)fd-=Math.PI*2; while(fd<-Math.PI)fd+=Math.PI*2;
-      if(ship.fireTimer<=0&&Math.abs(fd)<0.30){
-        ship.burstLeft=BURST_SIZE; ship.burstTimer=1; ship.fireTimer=Math.max(8,BURST_CD-(BURST_CD+35)+Math.floor(Math.random()*12));
-        ship.burstTarget=pTgt;
+      // Type 3 joueur : ne peut pas tirer devant lui
+      if(ship.shipType===3){
+        const _ptDist=Math.hypot(pTgt.x-ship.x,pTgt.y-ship.y);
+        const _t2p=Math.min(_ptDist/BULLET_SPEED,45);
+        let _pfd=Math.atan2(pTgt.y+pTgt.vy*_t2p-ship.y,pTgt.x+pTgt.vx*_t2p-ship.x)-ship.angle;
+        while(_pfd>Math.PI)_pfd-=Math.PI*2; while(_pfd<-Math.PI)_pfd+=Math.PI*2;
+        if(Math.abs(_pfd)<=TYPE3_FWDBLK) pTgt=null; // cible dans l'arc avant → pas de tir
+      }
+      if(pTgt){
+        ship.fireTimer--;
+        const t2=Math.min(pTDist/BULLET_SPEED,45);
+        let fd=Math.atan2(pTgt.y+pTgt.vy*t2-ship.y,pTgt.x+pTgt.vx*t2-ship.x)-ship.angle;
+        while(fd>Math.PI)fd-=Math.PI*2; while(fd<-Math.PI)fd+=Math.PI*2;
+        const _pcd=ship.shipType===3?TYPE3_CD:Math.max(8,BURST_CD-(BURST_CD+35));
+        if(ship.fireTimer<=0&&Math.abs(fd)<(ship.shipType===3?Math.PI:0.30)){
+          ship.burstLeft=ship.burstSz||BURST_SIZE; ship.burstTimer=1; ship.fireTimer=_pcd+Math.floor(Math.random()*12);
+          ship.burstTarget=pTgt;
+        }
       }
     }
   }
@@ -1356,6 +1684,7 @@ function update(){
   for(const ai of blues){updateAI(ai,reds);           applyGravity(ai,false); wallBounce(ai);}
   for(const ai of reds) {updateAI(ai,[...blues,ship]);applyGravity(ai,false); wallBounce(ai);}
   updateCaptures();
+  updateSpawnTurrets();
   updateWorldSystems();
 
   for(let i=bullets.length-1;i>=0;i--){
@@ -1363,8 +1692,29 @@ function update(){
     b.x+=b.vx; b.y+=b.vy; b.life--;
     if(b.life<=0){bullets.splice(i,1);continue;}
     if(applyGravity(b,true)){addSpark(b.x,b.y,b.team);bullets.splice(i,1);continue;}
-    // Guidage missile
-    if(b.target&&!b.target.dead){
+    // Guidage missile / magnétique type 2
+    if(b.homing){
+      // Aimantation : trouver la cible la plus proche si la cible courante est morte
+      let _htgt=b.target&&!b.target.dead?b.target:null;
+      if(!_htgt){
+        const _pool=b.team==='blue'?reds:[...blues,ship];
+        let _hd=Infinity;
+        for(const _he of _pool){
+          if(_he.dead) continue;
+          const _d2=Math.hypot(_he.x-b.x,_he.y-b.y);
+          if(_d2<_hd&&_d2<FIRE_RANGE*1.5){_hd=_d2;_htgt=_he;}
+        }
+        if(_htgt) b.target=_htgt;
+      }
+      if(_htgt){
+        let da2=Math.atan2(_htgt.y-b.y,_htgt.x-b.x)-Math.atan2(b.vy,b.vx);
+        while(da2>Math.PI)da2-=Math.PI*2; while(da2<-Math.PI)da2+=Math.PI*2;
+        const turn2=Math.max(-TYPE2_HOME,Math.min(TYPE2_HOME,da2));
+        const spd2=Math.hypot(b.vx,b.vy);
+        const na2=Math.atan2(b.vy,b.vx)+turn2;
+        b.vx=Math.cos(na2)*spd2; b.vy=Math.sin(na2)*spd2;
+      }
+    } else if(b.target&&!b.target.dead){
       let da=Math.atan2(b.target.y-b.y,b.target.x-b.x)-Math.atan2(b.vy,b.vx);
       while(da>Math.PI)da-=Math.PI*2; while(da<-Math.PI)da+=Math.PI*2;
       const turn=Math.max(-0.07,Math.min(0.07,da));
@@ -1377,7 +1727,7 @@ function update(){
     let hit=false;
     for(const e of tgts){
       if(e.dead) continue;
-      if(Math.hypot(b.x-e.x,b.y-e.y)<SHIP_RADIUS*(b.owner==='player'?1.6:1.3)){
+      const _eHR=(e.radius||SHIP_RADIUS)*(b.owner==='player'?1.4:1.1); if(Math.hypot(b.x-e.x,b.y-e.y)<_eHR){
         addSpark(b.x,b.y,b.team);
         const wasPlayer=b.owner==='player';
         if(!takeHit(e)){
@@ -1404,7 +1754,7 @@ function update(){
     if(hit){bullets.splice(i,1);continue;}
 
     // Bullets rouges vs joueur
-    if(b.team==='red'&&!ship.dead&&Math.hypot(b.x-ship.x,b.y-ship.y)<SHIP_RADIUS*0.9){
+    if(b.team==='red'&&!ship.dead&&Math.hypot(b.x-ship.x,b.y-ship.y)<(ship.radius||SHIP_RADIUS)*0.9){
       addSpark(b.x,b.y,'red');
       if(!takeHit(ship)){
         ship.hp--; ship.hit=10;
@@ -1414,6 +1764,19 @@ function update(){
       }
       bullets.splice(i,1); continue;
     }
+
+    // Bullets vs tourelles de stations (ennemies ou neutres)
+    let turretHit=false;
+    for(const sp of spawns){
+      if(sp.turretHp<=0||sp.team===b.team) continue;
+      if(Math.hypot(b.x-sp.x,b.y-sp.y)<30){
+        sp.turretHp--;
+        addSpark(b.x,b.y,b.team);
+        if(sp.turretHp<=0){sp.turretRespawnTimer=1800;addLog([{text:'TOURELLE',col:teamCol(sp.team)},{text:' détruite',col:'#888'}]);}
+        bullets.splice(i,1); turretHit=true; break;
+      }
+    }
+    if(turretHit) continue;
 
     let astHit=false;
     for(const a of nearA(b.x,b.y)){
@@ -1447,6 +1810,78 @@ function update(){
     if(metHit){bullets.splice(i,1);continue;}
   }
 
+  // ── Lasers type 3 ────────────────────────────────────────────────────────
+  for(let _li=lasers.length-1;_li>=0;_li--){
+    const _lz=lasers[_li];
+    _lz.life--;
+    if(_lz.life<=0||_lz.shooter.dead){lasers.splice(_li,1);continue;}
+    const _lfw=Math.cos(_lz.shooter.angle),_lfu=Math.sin(_lz.shooter.angle);
+    const _llx=-_lfu,_lly=_lfw;
+    const _lsh=_lz.shooter;
+    // 1 canon par laser (côté gauche ou droit)
+    const _lsign=(_lz.side==='right')?-1:1; // défaut gauche si side absent
+    const _lc0={x:_lsh.x+_llx*_lsign*26,y:_lsh.y+_lly*_lsign*26};
+    const _lcpos=[_lc0];
+    _lz.cannons=_lcpos;
+    // Déterminer direction de chaque canon (vers la cible si vivante)
+    const _ltgt=_lz.target&&!_lz.target.dead?_lz.target:null;
+    // Dégâts périodiques
+    if(++_lz.dmgTimer>=TYPE3_LASER_DMG_CD){
+      _lz.dmgTimer=0;
+      if(_ltgt){
+        const _lrange=FIRE_RANGE*1.35;
+        const _lfoes=_lz.team==='blue'?reds:[...blues,ship];
+        for(const _lc of _lcpos){
+          const _lang=Math.atan2(_ltgt.y-_lc.y,_ltgt.x-_lc.x);
+          // Vérifier arc avant bloqué
+          let _lfd=_lang-_lz.shooter.angle;
+          while(_lfd>Math.PI)_lfd-=Math.PI*2;while(_lfd<-Math.PI)_lfd+=Math.PI*2;
+          if(Math.abs(_lfd)<=TYPE3_FWDBLK) continue;
+          const _ldx=Math.cos(_lang),_ldy=Math.sin(_lang);
+          for(const _le of _lfoes){
+            if(_le.dead) continue;
+            const _lex=_le.x-_lc.x,_ley=_le.y-_lc.y;
+            const _lproj=Math.max(0,Math.min(_lrange,_lex*_ldx+_ley*_ldy));
+            const _lcx=_lc.x+_ldx*_lproj,_lcy=_lc.y+_ldy*_lproj;
+            if(Math.hypot(_le.x-_lcx,_le.y-_lcy)<(_le.radius||SHIP_RADIUS)+6){
+              addSpark(_le.x,_le.y,_lz.team);
+              const _lwp=_lz.owner==='player';
+              if(!takeHit(_le)){
+                _le.hp--; _le.hit=10;
+                if(_le.hp<=0){
+                  _le.dead=true;_le.respawnTimer=RESPAWN_FRAMES;
+                  addExplosion(_le.x,_le.y,_le.team);teamLives[_le.team]--;
+                  dropPickup(_le.x,_le.y);playSound('explode',0.55,_le.x,_le.y);
+                  if(_lwp){_score+=100;_kills++;playerFeedback.push({type:'kill',life:90,maxLife:90});}
+                  addLog([{text:_lsh.name||'?',col:teamCol(_lz.team)},{text:' ✕ ',col:'#888'},{text:_le.name||'JOUEUR',col:teamCol(_le.team)}]);
+                } else if(_lwp){_score+=10;playerFeedback.push({type:'hit',life:50,maxLife:50});}
+              } else if(_lwp){playerFeedback.push({type:'hit',life:50,maxLife:50});}
+            }
+          }
+          // Laser vs joueur (si laser rouge)
+          if(_lz.team==='red'&&!ship.dead){
+            const _spex=ship.x-_lc.x,_spey=ship.y-_lc.y;
+            const _sproj=Math.max(0,Math.min(_lrange,_spex*_ldx+_spey*_ldy));
+            const _spcx=_lc.x+_ldx*_sproj,_spcy=_lc.y+_ldy*_sproj;
+            if(Math.hypot(ship.x-_spcx,ship.y-_spcy)<(ship.radius||SHIP_RADIUS)+6){
+              addSpark(ship.x,ship.y,'red');
+              if(!takeHit(ship)){
+                ship.hp--;ship.hit=10;
+                if(ship.hp<=0){
+                  ship.dead=true;ship.respawnTimer=RESPAWN_FRAMES;
+                  addExplosion(ship.x,ship.y,'blue');teamLives.blue--;_playerLives--;
+                  dropPickup(ship.x,ship.y);playSound('explode',0.7);
+                  if(_playerLives<=0&&!_playerGameOver){_playerGameOver=true;if(_score>_highScore){_highScore=_score;localStorage.setItem(_hiKey,_highScore);}}
+                  addLog([{text:_lsh.name||'?',col:teamCol('red')},{text:' ✕ ',col:'#888'},{text:'JOUEUR',col:teamCol('blue')}]);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
   // Pickups (cubes de soin)
   for(let i=pickups.length-1;i>=0;i--){
     const pk=pickups[i];
@@ -1457,11 +1892,12 @@ function update(){
     let taken=false;
     for(const s of collectors){
       if(s.dead) continue;
-      if(Math.hypot(s.x-pk.x,s.y-pk.y)<SHIP_RADIUS*5){
-        const maxHp=s===ship?PLAYER_HP:AI_HP;
-        if(s.hp<maxHp||s.shield<SHIELD_MAX){
+      if(s.shipType===3) continue; // Type 3 : pas de soin par pickup
+      if(Math.hypot(s.x-pk.x,s.y-pk.y)<(s.radius||SHIP_RADIUS)*5){
+        const maxHp=s.maxHp??(s===ship?PLAYER_HP:AI_HP);
+        if(s.hp<maxHp||s.shield<(s.maxShield??SHIELD_MAX)){
           s.hp=Math.min(maxHp,s.hp+Math.max(1,Math.round(maxHp*0.25)));
-          if(s.shield<SHIELD_MAX){s.shield=Math.min(SHIELD_MAX,s.shield+1);s.shieldTimer=0;}
+          if(s.shield<(s.maxShield??SHIELD_MAX)){s.shield=Math.min((s.maxShield??SHIELD_MAX),s.shield+1);s.shieldTimer=0;}
           addPickupEffect(pk.x,pk.y);
           pickups.splice(i,1); taken=true; break;
         }
@@ -1788,21 +2224,78 @@ function drawSpawns(){
   for(const sp of spawns){
     const sx=sp.x-_camX+cx, sy=sp.y-_camY+cy;
     if(sx<-CULL_MG||sx>canvas.width+CULL_MG||sy<-CULL_MG||sy>canvas.height+CULL_MG) continue;
-    const col=sp.team==='red'?[220,60,40]:[40,120,220];
-    const capCol=sp.capTeam==='red'?[220,60,40]:[40,120,220];
+    const col=sp.team==='red'?[220,60,40]:sp.team==='neutral'?[170,170,190]:[40,120,220];
+    const capCol=sp.capTeam==='red'?[220,60,40]:sp.capTeam==='blue'?[40,120,220]:[170,170,190];
+    const rc=`rgba(${col[0]},${col[1]},${col[2]}`;
+    // Zone de capture
     ctx.beginPath(); ctx.arc(sx,sy,SPAWN_RADIUS,0,Math.PI*2);
-    ctx.fillStyle=`rgba(${col[0]},${col[1]},${col[2]},0.07)`; ctx.fill();
-    ctx.strokeStyle=`rgba(${col[0]},${col[1]},${col[2]},0.35)`; ctx.lineWidth=1.5;
-    ctx.setLineDash([8,6]); ctx.stroke(); ctx.setLineDash([]);
-    ctx.beginPath();ctx.moveTo(sx,sy-14);ctx.lineTo(sx+14,sy);ctx.lineTo(sx,sy+14);ctx.lineTo(sx-14,sy);ctx.closePath();
-    ctx.fillStyle=`rgba(${col[0]},${col[1]},${col[2]},0.9)`; ctx.fill();
-    ctx.strokeStyle='rgba(255,255,255,0.4)'; ctx.lineWidth=1; ctx.stroke();
+    ctx.fillStyle=`${rc},0.05)`; ctx.fill();
+    ctx.strokeStyle=`${rc},0.3)`; ctx.lineWidth=1.2;
+    ctx.setLineDash([7,5]); ctx.stroke(); ctx.setLineDash([]);
+    // Corps de la station : hub central
+    ctx.save(); ctx.translate(sx,sy);
+    // Bras + panneaux solaires (4 directions)
+    ctx.strokeStyle=`${rc},0.85)`; ctx.lineWidth=3;
+    for(let _arm=0;_arm<4;_arm++){
+      const _aang=_arm*Math.PI/2;
+      const _ax=Math.cos(_aang),_ay=Math.sin(_aang);
+      ctx.beginPath(); ctx.moveTo(_ax*10,_ay*10); ctx.lineTo(_ax*26,_ay*26); ctx.stroke();
+      // Panneau solaire
+      ctx.save(); ctx.translate(_ax*30,_ay*30); ctx.rotate(_aang+Math.PI/2);
+      ctx.fillStyle=`${rc},0.7)`;
+      ctx.fillRect(-10,-4,20,8);
+      ctx.strokeStyle=`${rc},0.4)`; ctx.lineWidth=0.8;
+      ctx.strokeRect(-10,-4,20,8);
+      // Lignes de cellules
+      ctx.beginPath(); ctx.moveTo(-3,-4); ctx.lineTo(-3,4); ctx.moveTo(3,-4); ctx.lineTo(3,4);
+      ctx.stroke();
+      ctx.restore();
+    }
+    // Hub central (octogone)
+    ctx.beginPath();
+    for(let _i=0;_i<8;_i++){const _a=_i*Math.PI/4;ctx.lineTo(Math.cos(_a)*11,Math.sin(_a)*11);}
+    ctx.closePath();
+    ctx.fillStyle=`${rc},0.25)`; ctx.fill();
+    ctx.strokeStyle=`${rc},0.9)`; ctx.lineWidth=1.5; ctx.stroke();
+    // Tourelle
+    if(sp.turretHp>0){
+      ctx.save(); ctx.rotate(sp.turretAngle);
+      // Base tourelle
+      ctx.beginPath(); ctx.arc(0,0,6,0,Math.PI*2);
+      ctx.fillStyle=sp.team==='neutral'?'rgba(150,150,170,0.8)':`${rc},0.9)`; ctx.fill();
+      ctx.strokeStyle='rgba(255,255,255,0.5)'; ctx.lineWidth=1; ctx.stroke();
+      // Canon
+      ctx.fillStyle='rgba(220,230,255,0.95)';
+      ctx.fillRect(4,-2.5,14,5);
+      ctx.strokeStyle='rgba(255,255,255,0.4)'; ctx.lineWidth=0.6; ctx.strokeRect(4,-2.5,14,5);
+      ctx.restore();
+      // HP tourelle (petits points)
+      for(let _h=0;_h<sp.turretMaxHp;_h++){
+        ctx.beginPath(); ctx.arc(-sp.turretMaxHp*5+_h*10+5,22,3,0,Math.PI*2);
+        ctx.fillStyle=_h<sp.turretHp?`${rc},0.9)`:'rgba(60,60,80,0.6)'; ctx.fill();
+      }
+    } else {
+      // Tourelle détruite — débris
+      ctx.save();
+      ctx.fillStyle='rgba(80,80,90,0.6)';
+      ctx.beginPath(); ctx.arc(3,-2,4,0,Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.arc(-2,4,3,0,Math.PI*2); ctx.fill();
+      ctx.restore();
+      // Timer de respawn
+      if(sp.turretRespawnTimer>0){
+        const _tp=1-sp.turretRespawnTimer/1800;
+        ctx.beginPath(); ctx.arc(0,0,8,0,_tp*Math.PI*2-Math.PI/2);
+        ctx.strokeStyle='rgba(255,200,50,0.6)'; ctx.lineWidth=2; ctx.stroke();
+      }
+    }
+    ctx.restore();
+    // Barre de progression capture
     if(sp.progress>0&&sp.capTeam){
       const endA=(sp.progress/CAPTURE_FRAMES)*Math.PI*2-Math.PI/2;
-      ctx.beginPath(); ctx.arc(sx,sy,SPAWN_RADIUS*0.75,-Math.PI/2,endA);
+      ctx.beginPath(); ctx.arc(sx,sy,SPAWN_RADIUS*0.72,-Math.PI/2,endA);
       ctx.strokeStyle=`rgba(${capCol[0]},${capCol[1]},${capCol[2]},0.9)`; ctx.lineWidth=4; ctx.stroke();
-      ctx.fillStyle='rgba(255,255,255,0.85)'; ctx.font='bold 11px monospace'; ctx.textAlign='center';
-      ctx.fillText(`${Math.floor(sp.progress/CAPTURE_FRAMES*100)}%`,sx,sy+30); ctx.textAlign='left';
+      ctx.fillStyle='rgba(255,255,255,0.85)'; ctx.font='bold 10px monospace'; ctx.textAlign='center';
+      ctx.fillText(`${Math.floor(sp.progress/CAPTURE_FRAMES*100)}%`,sx,sy+32); ctx.textAlign='left';
     }
   }
 }
@@ -1876,14 +2369,54 @@ function drawBullets(){
   }
 }
 
+function drawLasers(){
+  if(!lasers.length) return;
+  const cx=canvas.width/2, cy=canvas.height/2;
+  for(const _lz of lasers){
+    if(!_lz.cannons) continue;
+    const _ltgt=_lz.target&&!_lz.target.dead?_lz.target:null;
+    if(!_ltgt) continue;
+    const _alpha=(_lz.life/_lz.maxLife)*0.9+0.1;
+    const _flicker=0.85+Math.random()*0.15;
+    const _isBlue=_lz.team==='blue';
+    const _lrange=FIRE_RANGE*1.35;
+    for(const _lc of _lz.cannons){
+      const _lang=Math.atan2(_ltgt.y-_lc.y,_ltgt.x-_lc.x);
+      // Arc avant bloqué
+      let _lfd=_lang-_lz.shooter.angle;
+      while(_lfd>Math.PI)_lfd-=Math.PI*2;while(_lfd<-Math.PI)_lfd+=Math.PI*2;
+      if(Math.abs(_lfd)<=TYPE3_FWDBLK) continue;
+      const _ldx=Math.cos(_lang),_ldy=Math.sin(_lang);
+      const _sx=_lc.x-_camX+cx, _sy=_lc.y-_camY+cy;
+      const _ex=_sx+_ldx*_lrange, _ey=_sy+_ldy*_lrange;
+      // Halo extérieur
+      ctx.beginPath();ctx.moveTo(_sx,_sy);ctx.lineTo(_ex,_ey);
+      ctx.strokeStyle=_isBlue?`rgba(60,180,255,${_alpha*0.25*_flicker})`:`rgba(255,80,30,${_alpha*0.25*_flicker})`;
+      ctx.lineWidth=9;ctx.stroke();
+      // Faisceau principal
+      ctx.beginPath();ctx.moveTo(_sx,_sy);ctx.lineTo(_ex,_ey);
+      ctx.strokeStyle=_isBlue?`rgba(120,220,255,${_alpha*_flicker})`:`rgba(255,150,60,${_alpha*_flicker})`;
+      ctx.lineWidth=3;ctx.stroke();
+      // Cœur blanc
+      ctx.beginPath();ctx.moveTo(_sx,_sy);ctx.lineTo(_ex,_ey);
+      ctx.strokeStyle=`rgba(255,255,255,${_alpha*0.7*_flicker})`;
+      ctx.lineWidth=1;ctx.stroke();
+      // Étincelle au canon
+      ctx.beginPath();ctx.arc(_sx,_sy,3+Math.random()*2,0,Math.PI*2);
+      ctx.fillStyle=_isBlue?`rgba(180,240,255,${_alpha})`:`rgba(255,200,100,${_alpha})`;
+      ctx.fill();
+    }
+  }
+}
 function drawShield(sx,sy,rad,obj,rgb){
   if(obj.shield<=0&&obj.shieldHit<=0) return;
-  const alpha=obj.shield>0?0.4*(obj.shield/SHIELD_MAX):0;
+  const _sMax=obj.maxShield??SHIELD_MAX;
+  const alpha=obj.shield>0?0.4*(obj.shield/_sMax):0;
   const fAlpha=obj.shieldHit>0?obj.shieldHit/22*0.75:0;
   if(alpha>0){
     for(let s=0;s<obj.shield;s++){
-      const a0=s*(Math.PI*2/SHIELD_MAX)-Math.PI/2;
-      const a1=a0+(Math.PI*2/SHIELD_MAX)*0.82;
+      const a0=s*(Math.PI*2/_sMax)-Math.PI/2;
+      const a1=a0+(Math.PI*2/_sMax)*0.82;
       ctx.beginPath(); ctx.arc(sx,sy,rad+9,a0,a1);
       ctx.strokeStyle=`rgba(${rgb},${alpha*1.6})`; ctx.lineWidth=2.5; ctx.stroke();
     }
@@ -1902,52 +2435,80 @@ function drawFlame(yOff,both){
   ctx.ellipse(-14-fLen/2,yOff,fLen/2,both?6+Math.random()*3:2.5,0,0,Math.PI*2); ctx.fill();
 }
 
-function drawAIFleet(fleet,fillCol,strokeCol,barCol,rgb){
+function drawAIFleet(fleet,fillColT1,strokeColT1,barCol,rgb){
   const cx=canvas.width/2, cy=canvas.height/2;
   for(const ai of fleet){
     if(ai.dead) continue;
     const sx=ai.x-_camX+cx, sy=ai.y-_camY+cy;
     if(sx<-CULL_MG||sx>canvas.width+CULL_MG||sy<-CULL_MG||sy>canvas.height+CULL_MG) continue;
-    drawShield(sx,sy,SHIP_RADIUS,ai,rgb);
+    const aiR=ai.radius||SHIP_RADIUS;
+    drawShield(sx,sy,aiR,ai,rgb);
     if(ai.immuneTimer>0&&Math.floor(ai.immuneTimer/5)%2===0) continue;
     ctx.save(); ctx.translate(sx,sy); ctx.rotate(ai.angle);
-    if(Math.hypot(ai.vx,ai.vy)>0.4){
-      if(ai.team==='red'){
-        // Deux réacteurs aux coins arrière du sablier (y = ±12)
-        drawFlame(-12,false); drawFlame(12,false);
-      } else {
-        const av=ai.angVel, th=0.003;
-        if(Math.abs(av)<=th) drawFlame(0,true);
-        else if(av>th) drawFlame(-7,false);
+    // Couleur uniforme par équipe (même palette que T1)
+    const _fc=fillColT1, _sc=strokeColT1;
+    const fc=ai.hit>0?'#c8cce8':_fc, sc=ai.hit>0?'#ffffff':_sc;
+    if(ai.shipType===3){
+      // ── Type 3 : grand cuirassé ──────────────────────────────────────────
+      const S=2.1; ctx.scale(S,S);
+      if(Math.hypot(ai.vx,ai.vy)>0.2){drawFlame(-9,false);drawFlame(0,true);drawFlame(9,false);}
+      // Corps hexagonal allongé
+      ctx.fillStyle=fc; ctx.strokeStyle=sc; ctx.lineWidth=2;
+      ctx.beginPath();
+      ctx.moveTo(22,0);ctx.lineTo(14,-11);ctx.lineTo(-12,-12);
+      ctx.lineTo(-18,0);ctx.lineTo(-12,12);ctx.lineTo(14,11);
+      ctx.closePath(); ctx.fill(); ctx.stroke();
+      // Noyau central
+      ctx.beginPath(); ctx.arc(2,0,6,0,Math.PI*2);
+      ctx.fillStyle=ai.hit>0?'rgba(255,255,255,0.5)':`rgba(${rgb},0.5)`; ctx.fill();
+      // Canons gauche (haut)
+      ctx.fillStyle=sc;
+      ctx.fillRect(2,-19,14,4); ctx.fillRect(-8,-19,10,4);
+      // Canons droit (bas)
+      ctx.fillRect(2,15,14,4); ctx.fillRect(-8,15,10,4);
+      // Embouts lumineux
+      const _ecol=ai.hit>0?'#fff':`rgba(${rgb},0.9)`;
+      ctx.fillStyle=_ecol;
+      ctx.fillRect(16,-20,4,6);ctx.fillRect(2,-20,4,6);
+      ctx.fillRect(16,14,4,6);ctx.fillRect(2,14,4,6);
+      ctx.scale(1/S,1/S);
+    } else if(ai.shipType===2){
+      // ── Type 2 : sablier agile ───────────────────────────────────────────
+      if(Math.hypot(ai.vx,ai.vy)>0.4){drawFlame(-12,false);drawFlame(12,false);}
+      ctx.fillStyle=fc; ctx.strokeStyle=sc; ctx.lineWidth=1.5;
+      ctx.beginPath();ctx.moveTo(-18,-12);ctx.lineTo(18,-12);ctx.lineTo(0,0);ctx.closePath();
+      ctx.fill();ctx.stroke();
+      ctx.beginPath();ctx.moveTo(-18,12);ctx.lineTo(18,12);ctx.lineTo(0,0);ctx.closePath();
+      ctx.fill();ctx.stroke();
+      ctx.beginPath();ctx.moveTo(0,-5);ctx.lineTo(5,0);ctx.lineTo(0,5);ctx.lineTo(-5,0);ctx.closePath();
+      const _df=ai.hit>0?'rgba(255,255,255,0.8)':`rgba(${rgb},0.7)`;
+      ctx.fillStyle=_df;ctx.fill();ctx.strokeStyle=sc;ctx.lineWidth=1;ctx.stroke();
+    } else {
+      // ── Type 1 : flèche ──────────────────────────────────────────────────
+      const av=ai.angVel,th=0.003;
+      if(Math.hypot(ai.vx,ai.vy)>0.4){
+        if(Math.abs(av)<=th)drawFlame(0,true);
+        else if(av>th)drawFlame(-7,false);
         else drawFlame(7,false);
       }
-    }
-    if(ai.team==='red'){
-      // Forme sablier VERTICAL : bases en haut/bas, pointe au centre
-      // Le vaisseau se déplace en horizontal (angle=0 → droite)
-      const fc=ai.hit>0?'#c8cce8':fillCol, sc=ai.hit>0?'#ffffff':strokeCol;
-      ctx.fillStyle=fc; ctx.strokeStyle=sc; ctx.lineWidth=1.5;
-      // Triangle supérieur : base [-18,-12]→[18,-12], apex (0,0)
-      ctx.beginPath(); ctx.moveTo(-18,-12); ctx.lineTo(18,-12); ctx.lineTo(0,0); ctx.closePath();
-      ctx.fill(); ctx.stroke();
-      // Triangle inférieur : base [-18,12]→[18,12], apex (0,0)
-      ctx.beginPath(); ctx.moveTo(-18,12); ctx.lineTo(18,12); ctx.lineTo(0,0); ctx.closePath();
-      ctx.fill(); ctx.stroke();
-      // Diamant central (croisement des deux triangles)
-      ctx.beginPath(); ctx.moveTo(0,-5); ctx.lineTo(5,0); ctx.lineTo(0,5); ctx.lineTo(-5,0); ctx.closePath();
-      ctx.strokeStyle=ai.hit>0?'#ffffff':strokeCol; ctx.lineWidth=1; ctx.stroke();
-      ctx.fillStyle=ai.hit>0?'#ffffff':'rgba(255,140,100,0.7)'; ctx.fill();
-    } else {
       ctx.beginPath();ctx.moveTo(20,0);ctx.lineTo(-14,-10);ctx.lineTo(-7,0);ctx.lineTo(-14,10);ctx.closePath();
-      ctx.fillStyle=ai.hit>0?'#c8cce8':fillCol; ctx.fill();
-      ctx.strokeStyle=ai.hit>0?'#ffffff':strokeCol; ctx.lineWidth=1.5; ctx.stroke();
-      ctx.beginPath(); ctx.arc(7,0,3.5,0,Math.PI*2); ctx.fillStyle='rgba(200,230,255,0.5)'; ctx.fill();
+      ctx.fillStyle=fc;ctx.fill();ctx.strokeStyle=sc;ctx.lineWidth=1.5;ctx.stroke();
+      ctx.beginPath();ctx.arc(7,0,3.5,0,Math.PI*2);
+      ctx.fillStyle=`rgba(${rgb},0.5)`;ctx.fill();
     }
     ctx.restore();
     const maxHp=ai.maxHp||AI_HP;
+    const hpBarW=ai.shipType===3?64:28;
+    const hpBarY=sy-(aiR+12);
     if(ai.hp<maxHp){
-      ctx.fillStyle='rgba(0,0,0,0.5)'; ctx.fillRect(sx-14,sy-24,28,3);
-      ctx.fillStyle=barCol; ctx.fillRect(sx-14,sy-24,28*(ai.hp/maxHp),3);
+      ctx.fillStyle='rgba(0,0,0,0.6)';ctx.fillRect(sx-hpBarW/2,hpBarY,hpBarW,4);
+      ctx.fillStyle=barCol;ctx.fillRect(sx-hpBarW/2,hpBarY,hpBarW*(ai.hp/maxHp),4);
+    }
+    if(ai.shipType===3){
+      ctx.fillStyle=ai.team==='blue'?'rgba(80,200,255,0.9)':'rgba(255,120,60,0.9)';
+      ctx.font='bold 9px monospace';ctx.textAlign='center';
+      ctx.fillText('['+ai.name+']',sx,sy+aiR*2.1+18);
+      ctx.textAlign='left';
     }
   }
 }
@@ -1981,20 +2542,54 @@ function drawPlayerShip(){
   const cx=canvas.width/2, cy=canvas.height/2;
   const psx=spectMode?ship.x-_camX+cx:cx;
   const psy=spectMode?ship.y-_camY+cy:cy;
-  drawShield(psx,psy,SHIP_RADIUS+2,ship,'80,160,255');
+  const _pRad=(ship.radius||SHIP_RADIUS);
+  drawShield(psx,psy,_pRad+2,ship,'80,160,255');
   ctx.save(); ctx.translate(psx,psy); ctx.rotate(ship.angle);
-  if(keys.left&&keys.right) drawFlame(0,true);
-  else{if(keys.left)drawFlame(-7,false);if(keys.right)drawFlame(7,false);}
-  ctx.beginPath();ctx.moveTo(20,0);ctx.lineTo(-14,-10);ctx.lineTo(-7,0);ctx.lineTo(-14,10);ctx.closePath();
-  ctx.fillStyle=ship.hit>0?'#c8cce8':'#152a5c'; ctx.fill();
-  ctx.strokeStyle=ship.hit>0?'#ffffff':'#4a9ff5'; ctx.lineWidth=1.5; ctx.stroke();
-  ctx.beginPath(); ctx.arc(7,0,4,0,Math.PI*2);
-  ctx.fillStyle=(keys.left||keys.right)?'rgba(120,220,255,0.85)':'rgba(60,140,200,0.5)';
-  ctx.fill(); ctx.strokeStyle='#8acfff'; ctx.lineWidth=0.8; ctx.stroke();
+  const _pType=ship.shipType||1;
+  if(_pType===3){
+    // Cuirassé joueur
+    const _S3=2.1; ctx.scale(_S3,_S3);
+    if(Math.hypot(ship.vx,ship.vy)>0.2||keys.left||keys.right){drawFlame(-9,false);drawFlame(0,true);drawFlame(9,false);}
+    ctx.fillStyle=ship.hit>0?'#c8cce8':'#061228';
+    ctx.strokeStyle=ship.hit>0?'#ffffff':'#00ccff'; ctx.lineWidth=2;
+    ctx.beginPath();ctx.moveTo(22,0);ctx.lineTo(14,-11);ctx.lineTo(-12,-12);ctx.lineTo(-18,0);ctx.lineTo(-12,12);ctx.lineTo(14,11);ctx.closePath();ctx.fill();ctx.stroke();
+    ctx.beginPath();ctx.arc(2,0,6,0,Math.PI*2);
+    ctx.fillStyle=(keys.left||keys.right)?'rgba(80,200,255,0.9)':'rgba(40,140,200,0.5)';ctx.fill();
+    ctx.fillStyle=ship.hit>0?'#ffffff':'#00ccff';
+    ctx.fillRect(2,-19,14,4);ctx.fillRect(-8,-19,10,4);
+    ctx.fillRect(2,15,14,4);ctx.fillRect(-8,15,10,4);
+    ctx.fillStyle='rgba(180,240,255,0.95)';
+    ctx.fillRect(16,-20,4,6);ctx.fillRect(2,-20,4,6);
+    ctx.fillRect(16,14,4,6);ctx.fillRect(2,14,4,6);
+    ctx.scale(1/_S3,1/_S3);
+  } else if(_pType===2){
+    // Intercepteur joueur
+    if(keys.left&&keys.right){drawFlame(-12,false);drawFlame(12,false);}
+    else{if(keys.left)drawFlame(-12,false);if(keys.right)drawFlame(12,false);}
+    ctx.fillStyle=ship.hit>0?'#c8cce8':'#0a3050';
+    ctx.strokeStyle=ship.hit>0?'#ffffff':'#50e8ff'; ctx.lineWidth=1.5;
+    ctx.beginPath();ctx.moveTo(-18,-12);ctx.lineTo(18,-12);ctx.lineTo(0,0);ctx.closePath();ctx.fill();ctx.stroke();
+    ctx.beginPath();ctx.moveTo(-18,12);ctx.lineTo(18,12);ctx.lineTo(0,0);ctx.closePath();ctx.fill();ctx.stroke();
+    ctx.beginPath();ctx.moveTo(0,-5);ctx.lineTo(5,0);ctx.lineTo(0,5);ctx.lineTo(-5,0);ctx.closePath();
+    ctx.fillStyle=(keys.left||keys.right)?'rgba(80,230,255,0.9)':'rgba(40,180,200,0.5)';
+    ctx.fill();ctx.strokeStyle='#50e8ff';ctx.lineWidth=1;ctx.stroke();
+  } else {
+    // Type 1 : chasseur flèche
+    if(keys.left&&keys.right) drawFlame(0,true);
+    else{if(keys.left)drawFlame(-7,false);if(keys.right)drawFlame(7,false);}
+    ctx.beginPath();ctx.moveTo(20,0);ctx.lineTo(-14,-10);ctx.lineTo(-7,0);ctx.lineTo(-14,10);ctx.closePath();
+    ctx.fillStyle=ship.hit>0?'#c8cce8':'#152a5c'; ctx.fill();
+    ctx.strokeStyle=ship.hit>0?'#ffffff':'#4a9ff5'; ctx.lineWidth=1.5; ctx.stroke();
+    ctx.beginPath(); ctx.arc(7,0,4,0,Math.PI*2);
+    ctx.fillStyle=(keys.left||keys.right)?'rgba(120,220,255,0.85)':'rgba(60,140,200,0.5)';
+    ctx.fill(); ctx.strokeStyle='#8acfff'; ctx.lineWidth=0.8; ctx.stroke();
+  }
   ctx.restore();
-  if(ship.hp<PLAYER_HP){
-    ctx.fillStyle='rgba(0,0,0,0.5)'; ctx.fillRect(cx-20,cy+22,40,4);
-    ctx.fillStyle='#4adf80'; ctx.fillRect(cx-20,cy+22,40*(ship.hp/PLAYER_HP),4);
+  const _maxHp=ship.maxHp||PLAYER_HP;
+  if(ship.hp<_maxHp){
+    const _bw=_pType===3?64:40;
+    ctx.fillStyle='rgba(0,0,0,0.5)'; ctx.fillRect(cx-_bw/2,cy+(_pType===3?36:22),_bw,4);
+    ctx.fillStyle='#4adf80'; ctx.fillRect(cx-_bw/2,cy+(_pType===3?36:22),_bw*(ship.hp/_maxHp),4);
   }
 }
 
@@ -2038,13 +2633,13 @@ function drawRadarArrows(){
     const angle=Math.atan2(dy,dx);
     const ax=cx+Math.cos(angle)*(RADAR_R-18), ay=cy+Math.sin(angle)*(RADAR_R-18);
     const alpha=0.75;
-    const isBlue=sp.team==='blue';
+    const isBlue=sp.team==='blue', isNeutral=sp.team==='neutral';
     const capProgress=sp.progress>0?sp.progress/CAPTURE_FRAMES:0;
     ctx.save();
     ctx.translate(ax,ay); ctx.rotate(Math.PI/4);
     const s=5+capProgress*2; // légèrement plus grand si en cours de capture
-    ctx.fillStyle=isBlue?`rgba(50,120,255,${alpha*0.6})`:`rgba(255,50,50,${alpha*0.6})`;
-    ctx.strokeStyle=isBlue?`rgba(120,180,255,${alpha})`:`rgba(255,120,80,${alpha})`;
+    ctx.fillStyle=isBlue?`rgba(50,120,255,${alpha*0.6})`:isNeutral?`rgba(160,160,180,${alpha*0.6})`:`rgba(255,50,50,${alpha*0.6})`;
+    ctx.strokeStyle=isBlue?`rgba(120,180,255,${alpha})`:isNeutral?`rgba(200,200,220,${alpha})`:`rgba(255,120,80,${alpha})`;
     ctx.lineWidth=1.5;
     ctx.fillRect(-s,-s,s*2,s*2);
     ctx.strokeRect(-s,-s,s*2,s*2);
@@ -2124,6 +2719,31 @@ function drawHUD(){
   }
 
 
+  // ── Notification de rally ────────────────────────────────────────────────
+  if(_rallyNotif){
+    const _rnt=_rallyNotif.life/_rallyNotif.maxLife;
+    const _rnAlpha=_rnt>0.8?1:(_rnt<0.15?_rnt/0.15:1);
+    const _rnY=isMobile?H*0.28:H*0.32;
+    const _rnX=W/2;
+    const _rnIsAtk=_rallyNotif.type==='attack';
+    ctx.save(); ctx.textAlign='center';
+    // Fond
+    const _rnW=isMobile?200:260, _rnH=isMobile?54:66;
+    const _rnBgCol=_rnIsAtk?`rgba(0,20,60,${_rnAlpha*0.82})`:`rgba(60,5,5,${_rnAlpha*0.82})`;
+    rr(ctx,_rnX-_rnW/2,_rnY-_rnH/2,_rnW,_rnH,8);
+    ctx.fillStyle=_rnBgCol; ctx.fill();
+    ctx.strokeStyle=_rnIsAtk?`rgba(74,173,255,${_rnAlpha*0.7})`:`rgba(255,60,60,${_rnAlpha*0.7})`;
+    ctx.lineWidth=1.5; ctx.stroke();
+    // Lignes de texte
+    _rallyNotif.lines.forEach((_rl,_ri)=>{
+      const _rSz=_ri===0?(isMobile?11:13):(_ri===2?(isMobile?12:15):(isMobile?10:12));
+      ctx.font=`bold ${_rSz}px monospace`;
+      ctx.shadowColor=_rnIsAtk?'#4aadff':'#ff4444'; ctx.shadowBlur=10*_rnAlpha;
+      ctx.fillStyle=_rl.col.replace(')',`,${_rnAlpha})`).replace('rgb','rgba');
+      ctx.fillText(_rl.text,_rnX,_rnY-18+_ri*20);
+    });
+    ctx.restore();
+  }
   if(!isMobile){
     const dEdge=MAP_RADIUS-Math.hypot(_camX,_camY);
     if(dEdge<700){
@@ -2250,75 +2870,12 @@ function drawHUD(){
     ctx.textAlign='left';
   }
   if(ship.dead){
-    if(_playerLives<=0){
-      // Plus de vies : GAME OVER joueur
-      ctx.fillStyle='rgba(0,0,0,0.82)'; ctx.fillRect(0,0,W,H);
-      ctx.textAlign='center';
-      // Titre
-      ctx.fillStyle='#ff3020'; ctx.font=`bold ${isMobile?34:52}px monospace`;
-      ctx.shadowColor='#ff0000'; ctx.shadowBlur=32;
-      ctx.fillText('GAME  OVER',W/2,H/2-80);
-      ctx.shadowBlur=0;
-      // Séparateur
-      ctx.strokeStyle='rgba(255,60,30,0.35)'; ctx.lineWidth=1;
-      ctx.beginPath(); ctx.moveTo(W/2-160,H/2-56); ctx.lineTo(W/2+160,H/2-56); ctx.stroke();
-      // Score
-      const scoreStr=String(_score).padStart(6,'0');
-      const hiStr=String(_highScore).padStart(6,'0');
-      const isNew=_score>=_highScore&&_score>0;
-      ctx.font=`bold ${isMobile?11:13}px monospace`;
-      ctx.fillStyle='rgba(255,220,80,0.6)'; ctx.fillText('SCORE',W/2,H/2-34);
-      ctx.font=`bold ${isMobile?28:38}px monospace`;
-      ctx.fillStyle='#ffe060'; ctx.shadowColor='#ffcc00'; ctx.shadowBlur=14;
-      ctx.fillText(scoreStr,W/2,H/2+2);
-      ctx.shadowBlur=0;
-      // Hi-score
-      ctx.font=`bold ${isMobile?10:12}px monospace`;
-      if(isNew){
-        ctx.fillStyle='#ff9900'; ctx.shadowColor='#ff6600'; ctx.shadowBlur=10;
-        ctx.fillText('✦ NOUVEAU RECORD ✦',W/2,H/2+30);
-        ctx.shadowBlur=0;
-      } else {
-        ctx.fillStyle='rgba(180,160,255,0.6)'; ctx.fillText(`HI-SCORE  ${hiStr}`,W/2,H/2+30);
-      }
-      // Stats
-      ctx.font=`${isMobile?10:12}px monospace`;
-      ctx.fillStyle='rgba(160,180,220,0.65)';
-      ctx.fillText(`KILLS : ${_kills}   CAPTURES : ${_caps}`,W/2,H/2+58);
-      // Rejouer
-      const blink=Math.floor(Date.now()/600)%2===0;
-      if(blink){
-        ctx.fillStyle='rgba(200,190,160,0.8)'; ctx.font=`bold ${isMobile?12:14}px monospace`;
-        ctx.fillText(isMobile?'— APPUYEZ POUR REJOUER —':'— APPUYEZ SUR F5 POUR REJOUER —',W/2,H/2+90);
-      }
-      ctx.textAlign='left';
-    } else {
+    {
       rr(ctx,W/2-160,H/2-32,320,52,7); ctx.fillStyle='rgba(4,8,28,0.88)'; ctx.fill();
       ctx.fillStyle='#5aadff'; ctx.font='bold 15px monospace'; ctx.textAlign='center';
       ctx.fillText(`RESPAWN dans ${Math.ceil(ship.respawnTimer/60)}s`,W/2,H/2-8);
-      // Icônes de vies restantes (petits vaisseaux)
-      const iconSize=13, gap=20, totalW=(_playerLives-1)*gap;
-      const startX=W/2-totalW/2;
-      ctx.fillStyle='#4aadff'; ctx.font='bold 13px monospace';
-      for(let li=0;li<_playerLives-1;li++){
-        // Petit triangle = vaisseau stylisé
-        const lx=startX+li*gap, ly=H/2+14;
-        ctx.beginPath(); ctx.moveTo(lx,ly-6); ctx.lineTo(lx-5,ly+5); ctx.lineTo(lx,ly+2); ctx.lineTo(lx+5,ly+5); ctx.closePath();
-        ctx.fillStyle='#4aadff'; ctx.fill();
-      }
       ctx.textAlign='left';
     }
-  }
-  // ── Vies restantes (hors mort) ────────────────────────────────────────
-  if(!ship.dead){
-    const lx0=isMobile?W/2-60:20, ly0=isMobile?H-32:H-32;
-    for(let li=0;li<_playerLives;li++){
-      const lx=lx0+li*22, ly=ly0;
-      ctx.beginPath(); ctx.moveTo(lx,ly-7); ctx.lineTo(lx-6,ly+6); ctx.lineTo(lx,ly+3); ctx.lineTo(lx+6,ly+6); ctx.closePath();
-      ctx.fillStyle=li===0?'#ff5030':'#4aadff'; ctx.shadowColor=li===0?'#ff0000':'#2288ff'; ctx.shadowBlur=6;
-      ctx.fill();
-    }
-    ctx.shadowBlur=0;
   }
 
   // ── Journal de combat ────────────────────────────────────────────────────
@@ -2411,7 +2968,7 @@ function drawMinimap(){
   // Spawns
   for(const sp of spawns){
     const px=MX+(sp.x+MAP_RADIUS)*scale, py=MY+(sp.y+MAP_RADIUS)*scale;
-    const col=sp.team==='red'?'#ff6050':'#4aadff';
+    const col=sp.team==='red'?'#ff6050':sp.team==='neutral'?'#888888':'#4aadff';
     ctx.fillStyle=col+'99';
     ctx.beginPath(); ctx.moveTo(px,py-3); ctx.lineTo(px+3,py); ctx.lineTo(px,py+3); ctx.lineTo(px-3,py); ctx.closePath(); ctx.fill();
   }
@@ -2434,7 +2991,7 @@ function drawMinimap(){
     // Ennemi dans une nébuleuse → masqué
     if(!mmBeaconReveal&&nebulaFactor(ai.x,ai.y)<1) continue;
     const px=MX+(ai.x+MAP_RADIUS)*scale, py=MY+(ai.y+MAP_RADIUS)*scale;
-    ctx.beginPath(); ctx.arc(px,py,1.5,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(px,py,ai.shipType===3?4:1.5,0,Math.PI*2); ctx.fill();
   }
   // Bleus (alliés)
   ctx.fillStyle='#4aadff';
@@ -2442,7 +2999,7 @@ function drawMinimap(){
     // Alliés dans nébuleuse : masqués si le joueur est lui-même dans une nébuleuse
     if(mmPlayerInNebula) continue;
     const px=MX+(ai.x+MAP_RADIUS)*scale, py=MY+(ai.y+MAP_RADIUS)*scale;
-    ctx.beginPath(); ctx.arc(px,py,1.5,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(px,py,ai.shipType===3?4:1.5,0,Math.PI*2); ctx.fill();
   }
   // Brouillage visuel sur la minimap si dans nébuleuse
   if(mmPlayerInNebula){
@@ -2478,6 +3035,23 @@ function drawMinimap(){
     const mpx=MX+(m.x+MAP_RADIUS)*scale, mpy=MY+(m.y+MAP_RADIUS)*scale;
     ctx.beginPath(); ctx.arc(mpx,mpy,1.2,0,Math.PI*2); ctx.fill();
   }
+  // ── Marqueurs de rally ──────────────────────────────────────────────────
+  for(const _rm of _rallyMarkers){
+    if(_rm.t3.dead) continue;
+    const _rpx=MX+(_rm.t3.x+MAP_RADIUS)*scale, _rpy=MY+(_rm.t3.y+MAP_RADIUS)*scale;
+    const _rfade=_rm.life/_rm.maxLife;
+    const _rpulse=0.5+0.5*Math.sin(_gameTick*0.18);
+    const _rcol=_rm.type==='attack'?`rgba(255,80,60,${_rfade*0.9})`:`rgba(255,220,50,${_rfade*0.9})`;
+    // Anneau pulsant
+    ctx.strokeStyle=_rcol; ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.arc(_rpx,_rpy,6+_rpulse*4,0,Math.PI*2); ctx.stroke();
+    ctx.beginPath(); ctx.arc(_rpx,_rpy,10+_rpulse*6,0,Math.PI*2);
+    ctx.strokeStyle=_rm.type==='attack'?`rgba(255,80,60,${_rfade*0.4})`:`rgba(255,220,50,${_rfade*0.4})`;
+    ctx.stroke();
+    // Icône ✦ au centre
+    ctx.fillStyle=_rcol; ctx.font='bold 8px monospace'; ctx.textAlign='center';
+    ctx.fillText(_rm.type==='attack'?'✦':'⚠',_rpx,_rpy+3); ctx.textAlign='left';
+  }
   // Rectangle de vue
   const vW=(canvas.width/ZOOM_WORLD)*scale, vH=(canvas.height/ZOOM_WORLD)*scale;
   const vx=MX+(_camX+MAP_RADIUS)*scale-vW/2, vy=MY+(_camY+MAP_RADIUS)*scale-vH/2;
@@ -2509,226 +3083,146 @@ function updateCamera(){
   _camY=_spectTarget?_spectTarget.y:ship.y;
 }
 // ── Musique de fond procédurale ───────────────────────────────────────────
-let _musicMuted=false, _musicMaster=null, _musicIv=null;
+let _musicMuted=false, _musicMaster=null, _musicIv=[];
 function startBGMusic(){
   if(!_ac) return;
   _resumeAC();
+  const sr=_ac.sampleRate;
+  const T=_ac.currentTime;
 
-  // ── Ré mineur, 128 BPM, boucle ~30s, style Gradius/R-Type NES ──────────
-  const BPM=128, B=60/BPM;
-
-  // Master + fade-in
+  // ── Master → destination ─────────────────────────────────────────────────
   const master=_ac.createGain();
-  master.gain.setValueAtTime(0,_ac.currentTime);
-  master.gain.linearRampToValueAtTime(0.13,_ac.currentTime+1.5);
+  master.gain.setValueAtTime(0,T);
+  master.gain.linearRampToValueAtTime(1.0,T+3);
   master.connect(_ac.destination);
   _musicMaster=master;
 
-  // ── Pré-générer les buffers de bruit UNE SEULE FOIS ─────────────────────
-  const sr=_ac.sampleRate;
-  const _kickBuf=_ac.createBuffer(1,Math.ceil(sr*0.05),sr);
-  {const d=_kickBuf.getChannelData(0);for(let i=0;i<d.length;i++)d[i]=Math.random()*2-1;}
-  const _snareBuf=_ac.createBuffer(1,Math.ceil(sr*0.13),sr);
-  {const d=_snareBuf.getChannelData(0);for(let i=0;i<d.length;i++)d[i]=Math.random()*2-1;}
-  const _hihatBuf=_ac.createBuffer(1,Math.ceil(sr*0.035),sr);
-  {const d=_hihatBuf.getChannelData(0);for(let i=0;i<d.length;i++)d[i]=Math.random()*2-1;}
-
-  // ── Helpers sons (réutilisent les buffers pré-générés) ───────────────────
-  function melNote(freq,t,dur,vol){
-    if(!freq||freq<=0) return;
-    const o=_ac.createOscillator(),g=_ac.createGain(),flt=_ac.createBiquadFilter();
-    o.type='square';o.frequency.value=freq;
-    flt.type='lowpass';flt.frequency.value=2400;flt.Q.value=0.4;
-    o.connect(flt);flt.connect(g);g.connect(master);
-    g.gain.setValueAtTime(0,t);
-    g.gain.linearRampToValueAtTime(vol,t+0.014);
-    g.gain.setValueAtTime(vol*0.75,t+dur*0.5);
-    g.gain.linearRampToValueAtTime(0,t+dur+0.02);
-    o.start(t);o.stop(t+dur+0.06);
-  }
-  function triNote(freq,t,dur,vol){
-    if(!freq||freq<=0) return;
-    const o=_ac.createOscillator(),g=_ac.createGain();
-    o.type='triangle';o.frequency.value=freq;
-    o.connect(g);g.connect(master);
-    g.gain.setValueAtTime(0,t);
-    g.gain.linearRampToValueAtTime(vol,t+0.015);
-    g.gain.setValueAtTime(vol*0.6,t+dur*0.6);
-    g.gain.linearRampToValueAtTime(0,t+dur+0.02);
-    o.start(t);o.stop(t+dur+0.06);
-  }
-  function bassNote(freq,t,dur,vol){
-    const o=_ac.createOscillator(),g=_ac.createGain();
-    o.type='triangle';o.frequency.value=freq;
-    o.connect(g);g.connect(master);
-    g.gain.setValueAtTime(0,t);
-    g.gain.linearRampToValueAtTime(vol,t+0.02);
-    g.gain.setValueAtTime(vol*0.5,t+dur*0.6);
-    g.gain.linearRampToValueAtTime(0,t+dur*0.9);
-    o.start(t);o.stop(t+dur+0.05);
-  }
-  function kick(t){
-    const o=_ac.createOscillator(),og=_ac.createGain();
-    o.frequency.setValueAtTime(200,t);o.frequency.exponentialRampToValueAtTime(38,t+0.12);
-    og.gain.setValueAtTime(0.6,t);og.gain.exponentialRampToValueAtTime(0.001,t+0.14);
-    o.connect(og);og.connect(master);o.start(t);o.stop(t+0.16);
-    const src=_ac.createBufferSource();src.buffer=_kickBuf;
-    const fk=_ac.createBiquadFilter();fk.type='bandpass';fk.frequency.value=100;fk.Q.value=1;
-    const gk=_ac.createGain();
-    src.connect(fk);fk.connect(gk);gk.connect(master);
-    gk.gain.setValueAtTime(0.35,t);gk.gain.exponentialRampToValueAtTime(0.001,t+0.06);
-    src.start(t);src.stop(t+0.07);
-  }
-  function snare(t){
-    const src=_ac.createBufferSource();src.buffer=_snareBuf;
-    const fh=_ac.createBiquadFilter();fh.type='highpass';fh.frequency.value=2000;
-    const g=_ac.createGain();
-    src.connect(fh);fh.connect(g);g.connect(master);
-    g.gain.setValueAtTime(0.32,t);g.gain.exponentialRampToValueAtTime(0.001,t+0.12);
-    src.start(t);src.stop(t+0.14);
-  }
-  function hihat(t,vol=0.09){
-    const src=_ac.createBufferSource();src.buffer=_hihatBuf;
-    const fh=_ac.createBiquadFilter();fh.type='highpass';fh.frequency.value=9000;
-    const g=_ac.createGain();
-    src.connect(fh);fh.connect(g);g.connect(master);
-    g.gain.setValueAtTime(vol,t);g.gain.exponentialRampToValueAtTime(0.001,t+0.032);
-    src.start(t);src.stop(t+0.04);
+  // ── Delay/écho (effet flottant sans convolver) ───────────────────────────
+  const delay=_ac.createDelay(3.0); delay.delayTime.value=0.7;
+  const fbGain=_ac.createGain(); fbGain.gain.value=0.52;
+  const delOut=_ac.createGain(); delOut.gain.value=0.38;
+  delay.connect(fbGain); fbGain.connect(delay); // boucle feedback
+  delay.connect(delOut); delOut.connect(master);
+  // Helper : envoie un nœud vers master ET vers le delay
+  function toMix(node,dryVol,wetVol){
+    const d=_ac.createGain(); d.gain.value=dryVol; node.connect(d); d.connect(master);
+    const w=_ac.createGain(); w.gain.value=wetVol; node.connect(w); w.connect(delay);
   }
 
-  // ══ DONNÉES MUSICALES — Ré mineur (Dm) ══════════════════════════════════
-  const MEL_A=[
-    [587.33,0.5],[698.46,0.5],[880,0.5],[1174.66,0.5],
-    [1046.5,0.5],[932.33,0.5],[880,1],
-    [783.99,0.5],[880,0.5],[783.99,0.5],[698.46,0.5],
-    [659.25,2],
-    [698.46,0.5],[783.99,0.5],[880,0.5],[932.33,0.5],
-    [880,0.5],[783.99,0.5],[698.46,1],
-    [659.25,0.5],[587.33,0.5],[523.25,0.5],[587.33,0.5],
-    [587.33,2],
-  ];
-  const MEL_B=[
-    [932.33,0.5],[880,0.5],[783.99,0.5],[698.46,0.5],
-    [659.25,0.5],[698.46,0.5],[659.25,1],
-    [698.46,1],[659.25,0.5],[587.33,0.5],
-    [523.25,2],
-    [587.33,0.5],[659.25,0.5],[783.99,0.5],[880,0.5],
-    [1046.5,0.5],[932.33,0.5],[880,1],
-    [783.99,0.5],[698.46,0.5],[659.25,0.5],[587.33,0.5],
-    [587.33,2],
-  ];
-  const MEL_C=[
-    [440,1],[523.25,0.5],[587.33,0.5],
-    [659.25,1],[698.46,1],
-    [698.46,0.5],[659.25,0.5],[587.33,0.5],[440,0.5],
-    [523.25,2],
-    [466.16,0.5],[523.25,0.5],[587.33,0.5],[466.16,0.5],
-    [440,1],[392,1],
-    [523.25,0.5],[440,0.5],[392,0.5],[349.23,0.5],
-    [392,2],
-  ];
-  const MEL_D=[
-    [587.33,0.5],[698.46,0.5],[880,0.5],[587.33,0.5],
-    [880,0.5],[783.99,0.5],[880,1],
-    [932.33,0.5],[880,0.5],[783.99,0.5],[698.46,0.5],
-    [587.33,2],
-    [659.25,0.5],[698.46,0.5],[659.25,0.5],[587.33,0.5],
-    [523.25,0.5],[587.33,0.5],[659.25,1],
-    [880,0.5],[783.99,0.5],[698.46,0.5],[587.33,0.5],
-    [587.33,2],
-  ];
-  const CTR_A=[[587.33,4],[698.46,4],[440,4],[392,4]];
-  const CTR_B=[[932.33,4],[880,4],[698.46,4],[783.99,4]];
-  const CTR_C=[[659.25,4],[698.46,4],[466.16,4],[523.25,4]];
-  const CTR_D=[[587.33,4],[932.33,4],[880,4],[587.33,4]];
-  const BASS_AD=[146.83,146.83,174.61,146.83,116.54,116.54,174.61,146.83,87.31,110,130.81,87.31,98,98,146.83,116.54];
-  const BASS_B =[146.83,110,146.83,174.61,98,146.83,98,116.54,116.54,87.31,116.54,146.83,110,82.41,138.59,110];
-  const BASS_C =[110,110,130.81,110,146.83,146.83,174.61,146.83,98,116.54,98,146.83,110,82.41,138.59,73.42];
-  const CH_AD=[[146.83,174.61,220],[116.54,146.83,174.61],[87.31,110,130.81],[98,116.54,146.83]];
-  const CH_B =[[146.83,174.61,220],[98,116.54,146.83],[116.54,146.83,174.61],[110,138.59,164.81]];
-  const CH_C =[[110,130.81,164.81],[146.83,174.61,220],[98,116.54,146.83],[110,138.59,164.81]];
-  const LOOP=64*B;
-  const SECS=[
-    {mel:MEL_A,ctr:CTR_A,bas:BASS_AD,ch:CH_AD},
-    {mel:MEL_B,ctr:CTR_B,bas:BASS_B, ch:CH_B},
-    {mel:MEL_C,ctr:CTR_C,bas:BASS_C, ch:CH_C},
-    {mel:MEL_D,ctr:CTR_D,bas:BASS_AD,ch:CH_AD},
-  ];
+  // ── Drones graves (D1 F1 A1 D2) ─────────────────────────────────────────
+  [36.71,43.65,55.0,73.41].forEach((df,i)=>{
+    const o=_ac.createOscillator(), g=_ac.createGain();
+    const flt=_ac.createBiquadFilter(); flt.type='lowpass'; flt.frequency.value=320;
+    o.type='sine'; o.frequency.value=df+(Math.random()-0.5)*0.3;
+    g.gain.setValueAtTime(0,T); g.gain.linearRampToValueAtTime(0.28,T+4+i*0.5);
+    o.connect(flt); flt.connect(g); toMix(g,0.7,0.3); o.start();
+    // LFO volume lent
+    const lfo=_ac.createOscillator(), lg=_ac.createGain();
+    lfo.frequency.value=0.05+Math.random()*0.05; lg.gain.value=0.06;
+    lfo.connect(lg); lg.connect(g.gain); lfo.start();
+  });
 
-  // ── Pré-calculer la timeline complète (offsets depuis début de boucle) ───
-  // Chaque entrée : [offsetSec, fn(absTime)]
-  // → on planifie QUELQUES événements à la fois (fine-grained) au lieu de tout d'un coup
-  const timeline=[];
-  function addE(off,fn){timeline.push([off,fn]);}
-
-  for(let s=0;s<4;s++){
-    const {mel,ctr,bas,ch}=SECS[s];
-    const ts0=s*16*B;
-    for(let i=0;i<16;i++){
-      const bt=ts0+i*B;
-      // Percussion
-      if(i%4===0||i%4===2) addE(bt,at=>kick(at));
-      if(i%4===1||i%4===3) addE(bt,at=>snare(at));
-      addE(bt,at=>hihat(at,0.10));
-      if(!isMobile) addE(bt+B*0.5,at=>hihat(at,0.05));
-      // Basse
-      const bf=bas[i]; addE(bt,at=>bassNote(bf,at,B*0.86,0.50));
-      // Arpège (sur mobile : 1 note/beat au lieu de 2)
-      const c=ch[Math.floor(i/4)];
-      const f1=c[(i*2)%c.length], f2=c[(i*2+1)%c.length];
-      addE(bt,at=>triNote(f1,at,B*0.40,0.048));
-      if(!isMobile) addE(bt+B*0.5,at=>triNote(f2,at,B*0.40,0.048));
+  // ── Pads harmoniques (Dm7 → Am → Gm → Fmaj7, ~22s/accord) ──────────────
+  const CHORDS=[
+    [73.41,110.0,146.83,174.61,220.0],   // Dm7
+    [110.0,164.81,220.0,261.63,329.63],  // Am
+    [98.0, 146.83,196.0, 233.08,293.66], // Gm
+    [87.31,130.81,174.61,220.0, 261.63], // Fmaj7
+  ];
+  const CDUR=22, XFADE=8;
+  function scheduleChord(idx,startT){
+    for(const freq of CHORDS[idx%4]){
+      const o=_ac.createOscillator(), g=_ac.createGain();
+      const flt=_ac.createBiquadFilter(); flt.type='lowpass'; flt.frequency.value=1400;
+      o.type=Math.random()<0.5?'sine':'triangle';
+      o.frequency.value=freq; o.detune.value=(Math.random()-0.5)*8;
+      const vol=0.16+Math.random()*0.08;
+      const atk=3.5+Math.random()*2;
+      g.gain.setValueAtTime(0,startT);
+      g.gain.linearRampToValueAtTime(vol,startT+atk);
+      g.gain.setValueAtTime(vol,startT+CDUR-4);
+      g.gain.linearRampToValueAtTime(0,startT+CDUR+XFADE);
+      o.connect(flt); flt.connect(g); toMix(g,0.45,0.55);
+      o.start(startT); o.stop(startT+CDUR+XFADE+0.5);
     }
-    // Contre-voix (désactivée sur mobile pour économiser le CPU)
-    if(!isMobile){
-      let ct=ts0;
-      for(const [f,b] of ctr){
-        const cf=f,cb=b,co=ct; addE(co,at=>triNote(cf,at,cb*B*0.90,0.065)); ct+=b*B;
+  }
+  const STEP=CDUR-XFADE*0.5;
+  for(let i=0;i<20;i++) scheduleChord(i,T+i*STEP);
+
+  // ── Shimmer haute (notes aiguës rares) ───────────────────────────────────
+  const SHIMMER=[880,1046.5,1174.66,1318.51,1567.98,1760];
+  function playShimmer(){
+    if(_musicMuted) return;
+    const o=_ac.createOscillator(), g=_ac.createGain();
+    o.type='sine'; o.frequency.value=SHIMMER[Math.floor(Math.random()*SHIMMER.length)];
+    const dur=5+Math.random()*4, t=_ac.currentTime;
+    g.gain.setValueAtTime(0,t);
+    g.gain.linearRampToValueAtTime(0.07,t+dur*0.3);
+    g.gain.linearRampToValueAtTime(0,t+dur);
+    o.connect(g); toMix(g,0.1,0.9);
+    o.start(t); o.stop(t+dur+0.3);
+  }
+  _musicIv.push(setInterval(()=>{ if(!_musicMuted&&Math.random()<0.5) playShimmer(); },7000));
+  setTimeout(playShimmer, 1500); // première shimmer rapide pour valider le son
+
+  // ── Mélodie structurée (phrases en Ré mineur) ────────────────────────────
+  // 4 phrases qui se succèdent, chacune = séquence de notes avec durée propre
+  // Fréquences : D3 E3 F3 G3 A3 Bb3 C4 D4 E4 F4 G4 A4 C5 D5
+  const _MF={D3:146.83,E3:164.81,F3:174.61,G3:196.0,A3:220.0,Bb3:233.08,
+             C4:261.63,D4:293.66,E4:329.63,F4:349.23,G4:392.0,A4:440.0,C5:523.25,D5:587.33};
+  // [fréq, durée_note_sec, volume_relatif]
+  const PHRASES=[
+    // Phrase 1 : descente lente A4→F3, mélancolique
+    [[_MF.A4,5.5,1.0],[_MF.G4,4.0,0.85],[_MF.F4,4.5,0.9],[_MF.E4,3.5,0.75],[_MF.D4,7.0,1.0]],
+    // Phrase 2 : montée D3→A4, espoir suspendu
+    [[_MF.D3,4.0,0.8],[_MF.F3,3.5,0.85],[_MF.A3,4.5,0.9],[_MF.C4,4.0,0.8],[_MF.D4,3.5,0.9],[_MF.F4,3.5,0.85],[_MF.A4,6.5,1.0]],
+    // Phrase 3 : balancement A3-C4-Bb3-G3-A3, flottant
+    [[_MF.A3,5.0,0.9],[_MF.C4,4.0,0.85],[_MF.Bb3,4.5,0.8],[_MF.G3,4.0,0.75],[_MF.A3,7.0,1.0]],
+    // Phrase 4 : D4→C5→A4→F4→D4, cinématique
+    [[_MF.D4,3.5,0.85],[_MF.F4,3.5,0.9],[_MF.A4,4.0,0.95],[_MF.C5,4.5,1.0],[_MF.A4,3.5,0.85],[_MF.F4,4.0,0.8],[_MF.D4,8.0,1.0]],
+  ];
+  let _phraseIdx=0;
+
+  function playMelPhrase(){
+    if(_musicMuted) return;
+    const phrase=PHRASES[_phraseIdx%PHRASES.length]; _phraseIdx++;
+    let t=_ac.currentTime+0.5;
+    const overlap=0.85; // chaque note commence à 85% de la durée de la précédente
+    for(const [freq,dur,vol] of phrase){
+      if(_musicMuted) break;
+      const noteVol=0.16*vol;
+      // Deux oscillateurs légèrement désaccordés → son plus riche
+      for(const detune of [-4,4]){
+        const o=_ac.createOscillator(), g=_ac.createGain();
+        // Vibrato léger
+        const vib=_ac.createOscillator(), vibG=_ac.createGain();
+        vib.frequency.value=4.5; vibG.gain.value=3;
+        vib.connect(vibG); vibG.connect(o.frequency);
+        o.type='sine'; o.frequency.value=freq; o.detune.value=detune;
+        const atk=Math.min(1.8,dur*0.3);
+        g.gain.setValueAtTime(0,t);
+        g.gain.linearRampToValueAtTime(noteVol,t+atk);
+        g.gain.setValueAtTime(noteVol*0.75,t+dur*0.75);
+        g.gain.linearRampToValueAtTime(0,t+dur);
+        o.connect(g); toMix(g,0.25,0.75);
+        vib.start(t); vib.stop(t+dur+0.2);
+        o.start(t); o.stop(t+dur+0.2);
       }
+      t+=dur*overlap;
     }
-    // Mélodie
-    let mt=ts0;
-    for(const [f,b] of mel){
-      const mf=f,mb=b,mo=mt; addE(mo,at=>melNote(mf,at,mb*B*0.80,0.098)); mt+=b*B;
-    }
+    // Planifier la prochaine phrase après la fin de celle-ci + silence
+    const totalDur=phrase.reduce((s,[,d])=>s+d*overlap,0)+phrase[phrase.length-1][1]*(1-overlap);
+    const silence=8+Math.random()*10;
+    _musicIv.push(setTimeout(()=>{ if(!_musicMuted) playMelPhrase(); }, (totalDur+silence)*1000));
   }
-  timeline.sort((a,b)=>a[0]-b[0]);
-
-  // ── Scheduler fin-grained : planifie ~200ms à l'avance, toutes les 80ms ─
-  // → Au lieu de 400+ nœuds d'un coup, on en crée 3-5 par tick
-  const AHEAD=isMobile?0.20:0.25;
-  const TICK =isMobile?80:100;
-  let loopStart=_ac.currentTime+0.05;
-  let evtIdx=0;
-
-  function tick(){
-    if(!_ac||_musicMuted) return;
-    const horizon=_ac.currentTime+AHEAD;
-    let guard=0;
-    while(guard++<100){
-      if(evtIdx<timeline.length){
-        const [off,fn]=timeline[evtIdx];
-        const absT=loopStart+off;
-        if(absT>horizon) break;
-        fn(absT);
-        evtIdx++;
-      } else {
-        // Fin de boucle : passer à la suivante
-        loopStart+=LOOP;
-        evtIdx=0;
-        if(loopStart+timeline[0][0]>horizon) break;
-      }
-    }
-  }
-
-  tick();
-  _musicIv=setInterval(tick,TICK);
+  // Lancer la première phrase après 6s (pour laisser les pads s'installer)
+  _musicIv.push(setTimeout(playMelPhrase, 6000));
 }
 function toggleMusic(){
   _musicMuted=!_musicMuted;
   if(_musicMaster){
-    const v=_musicMuted?0:0.11;
-    _musicMaster.gain.setTargetAtTime(v,_ac.currentTime,0.3);
+    const v=_musicMuted?0:1.0;
+    _musicMaster.gain.setTargetAtTime(v,_ac.currentTime,1.5);
   }
 }
 
@@ -2769,7 +3263,7 @@ function loop(){
   drawGrid(); drawBounds(); drawStars(); drawNebulae(); drawPlanet();
   drawEMP(); drawSpawns(); drawBeacon();
   drawAsteroids(); drawPickups(); drawWreckLoot();
-  drawParticles(); drawBullets(); drawMeteors();
+  drawParticles(); drawBullets(); drawLasers(); drawMeteors();
   drawAIFleet(blues,'#0d2060','#4080f0','#4aadff','80,150,255');
   drawAIFleet(reds, '#601010','#e04040','#ff6050','255,80,60');
   drawFormationLinks(); drawPlayerShip(); drawRadarArrows();
@@ -2778,16 +3272,14 @@ function loop(){
   {const nebInside=NEBULAE.find(n=>Math.hypot(_camX-n.x,_camY-n.y)<n.r);
   if(nebInside){ctx.fillStyle=`rgba(${nebInside.c[0]},${nebInside.c[1]},${nebInside.c[2]},0.13)`;ctx.fillRect(0,0,canvas.width,canvas.height);}}
   drawHUD();
-  // Effet dramatique post-mort : flash rouge qui se dissipe
+  // Effet dramatique post-mort
   if(_deathFxTimer>0){
     const t=_deathFxTimer/75;
     ctx.fillStyle=`rgba(180,0,0,${t*t*0.55})`;
     ctx.fillRect(0,0,canvas.width,canvas.height);
-    // Vignette sombre sur les bords
     const W=canvas.width,H=canvas.height;
     const vg=ctx.createRadialGradient(W/2,H/2,H*0.15,W/2,H/2,H*0.85);
-    vg.addColorStop(0,'rgba(0,0,0,0)');
-    vg.addColorStop(1,`rgba(0,0,0,${t*0.7})`);
+    vg.addColorStop(0,'rgba(0,0,0,0)'); vg.addColorStop(1,`rgba(0,0,0,${t*0.7})`);
     ctx.fillStyle=vg; ctx.fillRect(0,0,W,H);
   }
   if(gameOver) drawGameOver();
@@ -2797,17 +3289,14 @@ loop();
 function resizeCanvas(){canvas.width=window.innerWidth;canvas.height=window.innerHeight;}
 window.addEventListener('resize', resizeCanvas);
 window.addEventListener('orientationchange', ()=>{ setTimeout(resizeCanvas,120); });
-// ── Clic sur bouton mute (desktop) ───────────────────────────────────────
 canvas.addEventListener('click', e=>{
   if(!_gameStarted) return;
   const W=canvas.width, mx=W-38, my=56;
   if(Math.abs(e.clientX-mx)<18&&Math.abs(e.clientY-my)<16) toggleMusic();
 });
-// ── Tap sur mobile ────────────────────────────────────────────────────────
 if(isMobile){
   canvas.addEventListener('touchstart', e=>{
     if((gameOver||_playerGameOver)&&_gameStarted){ location.reload(); return; }
-    // Bouton mute
     if(!_gameStarted) return;
     const t=e.touches[0], W=canvas.width, mx=W-38, my=56;
     if(Math.abs(t.clientX-mx)<24&&Math.abs(t.clientY-my)<20) toggleMusic();
