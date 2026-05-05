@@ -125,13 +125,26 @@ canvas.height = window.innerHeight;
 
 // ── Audio (Web Audio API) ─────────────────────────────────────────────────
 const _ac=(()=>{try{return new(window.AudioContext||window.webkitAudioContext)();}catch(e){return null;}})();
+// ── Filtre nébuleuse global (étouffement sons + musique dans les nébuleuses) ──
+let _nebulaLPF=null, _nebulaOut=null;
+(()=>{
+  if(!_ac) return;
+  _nebulaLPF=_ac.createBiquadFilter();
+  _nebulaLPF.type='lowpass';
+  _nebulaLPF.frequency.value=18000; // ouvert par défaut
+  _nebulaLPF.Q.value=1.2;
+  _nebulaLPF.connect(_nebulaOut||_ac.destination);
+  _nebulaOut=_ac.createGain();
+  _nebulaOut.gain.value=1.0;
+  _nebulaOut.connect(_nebulaLPF);
+})();
 function _resumeAC(){ if(_ac&&_ac.state==='suspended') _ac.resume(); }
 canvas.addEventListener('mousedown',_resumeAC,{once:false});
 canvas.addEventListener('touchstart',_resumeAC,{once:false,passive:true});
 function playSound(type,vol=0.4){
   if(!_ac) return;
   const t=_ac.currentTime;
-  const g=_ac.createGain(); g.connect(_ac.destination);
+  const g=_ac.createGain(); g.connect(_nebulaOut||_ac.destination);
   const o=_ac.createOscillator();
   o.connect(g);
   if(type==='shoot'){
@@ -164,7 +177,7 @@ function playSound(type,vol=0.4){
     // Respawn joueur : accord montant
     [440,550,660].forEach((f,i)=>{
       const oo=_ac.createOscillator(), gg=_ac.createGain();
-      oo.connect(gg); gg.connect(_ac.destination);
+      oo.connect(gg); gg.connect(_nebulaOut||_ac.destination);
       oo.type='sine'; oo.frequency.value=f;
       const tt=t+i*0.08;
       gg.gain.setValueAtTime(0.001,tt); gg.gain.linearRampToValueAtTime(vol*0.4,tt+0.05);
@@ -186,7 +199,7 @@ function playSound(type,vol=0.4,wx,wy){
   }
   if(vol<0.015) return;
   const t=_ac.currentTime;
-  const g=_ac.createGain(); g.connect(_ac.destination);
+  const g=_ac.createGain(); g.connect(_nebulaOut||_ac.destination);
   const o=_ac.createOscillator(); o.connect(g);
   if(type==='shoot'){
     o.type='sawtooth'; o.frequency.setValueAtTime(820,t); o.frequency.exponentialRampToValueAtTime(180,t+0.08);
@@ -212,7 +225,7 @@ function playSound(type,vol=0.4,wx,wy){
   } else if(type==='respawn'){
     [440,550,660].forEach((f2,i)=>{
       const oo=_ac.createOscillator(), gg=_ac.createGain();
-      oo.connect(gg); gg.connect(_ac.destination);
+      oo.connect(gg); gg.connect(_nebulaOut||_ac.destination);
       oo.type='sine'; oo.frequency.value=f2;
       const tt=t+i*0.08;
       gg.gain.setValueAtTime(0.001,tt); gg.gain.linearRampToValueAtTime(vol*0.4,tt+0.05);
@@ -230,7 +243,7 @@ function initEngine(){
   _engOsc=_ac.createOscillator(); _engOsc.type='sawtooth';
   const filt=_ac.createBiquadFilter(); filt.type='lowpass'; filt.frequency.value=320;
   _engGain=_ac.createGain(); _engGain.gain.value=0;
-  _engOsc.connect(filt); filt.connect(_engGain); _engGain.connect(_ac.destination);
+  _engOsc.connect(filt); filt.connect(_engGain); _engGain.connect(_nebulaOut||_ac.destination);
   _engOsc.start();
 }
 function updateEngineSound(){
@@ -271,7 +284,7 @@ function updateDoppler(){
   const t=_ac.currentTime;
   const o=_ac.createOscillator(), g=_ac.createGain();
   const f=_ac.createBiquadFilter(); f.type='lowpass'; f.frequency.value=500;
-  o.connect(f); f.connect(g); g.connect(_ac.destination);
+  o.connect(f); f.connect(g); g.connect(_nebulaOut||_ac.destination);
   o.type='sawtooth';
   o.frequency.setValueAtTime(freq*(radVel<0?1.25:0.85),t);
   o.frequency.exponentialRampToValueAtTime(freq*(radVel<0?0.78:1.18),t+0.28);
@@ -574,6 +587,7 @@ function splitMeteor(m, meteors){
 
 function updateAsteroids(){
   const B=MAP_HALF;
+  const _astImpact=[];
   for(let i=ASTEROIDS.length-1;i>=0;i--){
     const a=ASTEROIDS[i];
     a.wx+=a.vx; a.wy+=a.vy;
@@ -617,6 +631,27 @@ function updateAsteroids(){
       const tang=(a.vy-b.vy)*cnx-(a.vx-b.vx)*cny;
       a.rotVel+=tang*0.0008/(a.radius*0.04+0.5);
       b.rotVel-=tang*0.0008/(b.radius*0.04+0.5);
+      // Dégâts de choc proportionnels à la vitesse d'impact
+      const _impV=Math.abs(vRelN);
+      if(_impV>1.2){
+        const _dmg=Math.floor(_impV/1.2);
+        if(a.hp===undefined){a.hp=rockHp(a.radius);a.maxHp=a.hp;}
+        if(b.hp===undefined){b.hp=rockHp(b.radius);b.maxHp=b.hp;}
+        a.hp-=_dmg; b.hp-=_dmg;
+        addSpark((a.wx+b.wx)*0.5,(a.wy+b.wy)*0.5,'blue');
+        _astImpact.push([a,b]);
+      }
+    }
+  }
+  // Traiter les destructions après les boucles
+  const _toRemA=new Set();
+  for(const [ra,rb] of _astImpact){
+    if(ra.hp<=0&&!_toRemA.has(ra)){_toRemA.add(ra);splitAsteroid(ra);}
+    if(rb.hp<=0&&!_toRemA.has(rb)){_toRemA.add(rb);splitAsteroid(rb);}
+  }
+  if(_toRemA.size){
+    for(let i=ASTEROIDS.length-1;i>=0;i--){
+      if(_toRemA.has(ASTEROIDS[i])){addExplosion(ASTEROIDS[i].wx,ASTEROIDS[i].wy,'blue');ASTEROIDS.splice(i,1);}
     }
   }
   rebuildAGrid();
@@ -1592,6 +1627,22 @@ function updateWorldSystems(){
           m.x=a.wx+anx*(m.r+a.radius*0.72+1); m.y=a.wy+any*(m.r+a.radius*0.72+1);
           addSpark(m.x,m.y,'blue');
           if(_astSfxThrottle===0){playSound('shield',0.18,m.x,m.y);_astSfxThrottle=8;}
+          // Dégâts de choc
+          const _maImpV=Math.abs(relV);
+          if(_maImpV>1.5){
+            const _maDmg=Math.floor(_maImpV/1.8);
+            if(m.hp===undefined){m.hp=rockHp(m.r);m.maxHp=m.hp;}
+            if(a.hp===undefined){a.hp=rockHp(a.radius);a.maxHp=a.hp;}
+            m.hp-=_maDmg; a.hp-=_maDmg;
+            if(a.hp<=0){
+              addExplosion(a.wx,a.wy,'blue'); splitAsteroid(a);
+              const _ai=ASTEROIDS.indexOf(a); if(_ai>=0){ASTEROIDS.splice(_ai,1);rebuildAGrid();}
+            }
+            if(m.hp<=0){
+              addExplosion(m.x,m.y,'blue'); splitMeteor(m,meteors);
+              meteors.splice(i,1); continue;
+            }
+          }
         }
       }
     }
@@ -1633,6 +1684,7 @@ function updateWorldSystems(){
     }
   }
   // ─ Collisions météore–météore ─
+  const _mmImpPend=[];
   for(let mi=0;mi<meteors.length;mi++){
     const ma=meteors[mi];
     for(let mj=mi+1;mj<meteors.length;mj++){
@@ -1653,8 +1705,25 @@ function updateWorldSystems(){
       ma.x+=mnx*mov*mmB/mmT; ma.y+=mny*mov*mmB/mmT;
       mb.x-=mnx*mov*mmA/mmT; mb.y-=mny*mov*mmA/mmT;
       addSpark((ma.x+mb.x)*0.5,(ma.y+mb.y)*0.5,'blue');
+      // Dégâts de choc météore-météore
+      const _mmImpV=Math.abs(mvRel);
+      if(_mmImpV>1.8){
+        const _mmDmg=Math.floor(_mmImpV/2.0);
+        if(ma.hp===undefined){ma.hp=rockHp(ma.r);ma.maxHp=ma.hp;}
+        if(mb.hp===undefined){mb.hp=rockHp(mb.r);mb.maxHp=mb.hp;}
+        ma.hp-=_mmDmg; mb.hp-=_mmDmg;
+        _mmImpPend.push([mi,mj]);
+      }
     }
   }
+  // Destructions météore-météore
+  const _mmDead=new Set();
+  for(const [mia,mjb] of _mmImpPend){
+    const _mma=meteors[mia], _mmb=meteors[mjb];
+    if(_mma&&_mma.hp<=0&&!_mmDead.has(mia)){_mmDead.add(mia);addExplosion(_mma.x,_mma.y,'blue');splitMeteor(_mma,meteors);}
+    if(_mmb&&_mmb.hp<=0&&!_mmDead.has(mjb)){_mmDead.add(mjb);addExplosion(_mmb.x,_mmb.y,'blue');splitMeteor(_mmb,meteors);}
+  }
+  if(_mmDead.size){const _sorted=[..._mmDead].sort((a,b)=>b-a);for(const _di of _sorted)meteors.splice(_di,1);}
   // ─ Balise de signal ─
   // Orbite autour de la planète centrale
   _beaconAngle+=BEACON_ORBIT_SPD;
@@ -1881,6 +1950,12 @@ function update(){
     }
   }
   if(_gameTick%60===0&&_gameStarted){
+    // Mise à jour filtre nébuleuse : étouffement progressif quand le joueur est dans une nébuleuse
+    if(_nebulaLPF&&_ac){
+      const _inNeb=nebulaFactor(_camX,_camY)<1;
+      const _targetFreq=_inNeb?520:18000;
+      _nebulaLPF.frequency.setTargetAtTime(_targetFreq,_ac.currentTime,0.8); // lissage ~0.8s
+    }
     const _nearEn=reds.filter(r=>!r.dead&&Math.hypot(r.x-ship.x,r.y-ship.y)<1400).length;
     const _hpRatio=ship.dead?0:ship.hp/(ship.maxHp||PLAYER_HP);
     const _lowHp=_hpRatio<0.4?0.35:0;
@@ -2359,17 +2434,174 @@ function drawPlanet(){
 
 function drawNebulae(){
   const cx=canvas.width/2, cy=canvas.height/2;
+  const _nt=Date.now()*0.00018;
   for(const n of NEBULAE){
     const sx=n.x-_camX+cx, sy=n.y-_camY+cy;
-    if(sx<-n.r-CULL_MG||sx>canvas.width+n.r+CULL_MG||sy<-n.r-CULL_MG||sy>canvas.height+n.r+CULL_MG) continue;
-    const g=ctx.createRadialGradient(sx,sy,0,sx,sy,n.r);
-    g.addColorStop(0,`rgba(${n.c[0]},${n.c[1]},${n.c[2]},0.18)`);
-    g.addColorStop(0.5,`rgba(${n.c[0]},${n.c[1]},${n.c[2]},0.09)`);
-    g.addColorStop(1,'rgba(0,0,0,0)');
-    ctx.beginPath(); ctx.arc(sx,sy,n.r,0,Math.PI*2); ctx.fillStyle=g; ctx.fill();
-    // Contour subtil
-    ctx.beginPath(); ctx.arc(sx,sy,n.r,0,Math.PI*2);
-    ctx.strokeStyle=`rgba(${n.c[0]},${n.c[1]},${n.c[2]},0.06)`; ctx.lineWidth=2; ctx.stroke();
+    if(sx<-n.r*2||sx>canvas.width+n.r*2||sy<-n.r*2||sy>canvas.height+n.r*2) continue;
+    const [r,g,b]=n.c;
+    const pls=0.5+0.5*Math.sin(_nt*0.65+n.x*0.00055);
+
+    // Couleurs dérivées
+    // Secondaire : couleur "froide/chaude" complémentaire pour zones de réflexion
+    const r2c=[Math.min(255,b*0.6+60)|0, Math.min(255,r*0.3+50)|0, Math.min(255,g*0.5+130)|0];
+    // Cœur blanchi
+    const rH=Math.min(255,r+90), gH=Math.min(255,g+90), bH=Math.min(255,b+90);
+
+    // ── Génération persistante (une seule fois) ──
+    if(!n._blobs){
+      n._blobs=[];
+      for(let i=0;i<14;i++){
+        const ba=Math.random()*Math.PI*2, bd=Math.random()*n.r*0.68;
+        n._blobs.push({ox:Math.cos(ba)*bd, oy:Math.sin(ba)*bd,
+          r:n.r*(0.18+Math.random()*0.55), a:0.055+Math.random()*0.095,
+          phase:Math.random()*Math.PI*2, speed:0.25+Math.random()*0.45,
+          sec: i>=10}); // 4 blobs avec couleur secondaire
+      }
+      n._knots=[];
+      for(let i=0;i<6;i++){
+        const ka=Math.random()*Math.PI*2, kd=Math.random()*n.r*0.72;
+        n._knots.push({ox:Math.cos(ka)*kd, oy:Math.sin(ka)*kd,
+          r:n.r*(0.055+Math.random()*0.085), phase:Math.random()*Math.PI*2,
+          hot: Math.random()>0.5}); // knots chauds (blancs) ou colorés
+      }
+      n._dust=[];
+      for(let i=0;i<5;i++){
+        const a1=Math.random()*Math.PI*2, d1=Math.random()*n.r*0.85;
+        const a2=a1+0.8+Math.random()*1.5, d2=Math.random()*n.r*0.85;
+        const cpd=n.r*(0.1+Math.random()*0.45), cpa=Math.random()*Math.PI*2;
+        n._dust.push({
+          x1:Math.cos(a1)*d1, y1:Math.sin(a1)*d1,
+          x2:Math.cos(a2)*d2, y2:Math.sin(a2)*d2,
+          cpx:Math.cos(cpa)*cpd, cpy:Math.sin(cpa)*cpd,
+          w:n.r*(0.07+Math.random()*0.13),
+          op:0.15+Math.random()*0.18});
+      }
+      n._fils=[];
+      for(let i=0;i<9;i++){
+        n._fils.push({baseA:Math.random()*Math.PI*2,
+          len:n.r*(0.4+Math.random()*0.5), w:n.r*(0.05+Math.random()*0.07),
+          phase:Math.random()*Math.PI*2, speed:0.25+Math.random()*0.35});
+      }
+      n._stars=[];
+      for(let i=0;i<42;i++){
+        const sa=Math.random()*Math.PI*2, sd=Math.random()*n.r*0.92;
+        n._stars.push({ox:Math.cos(sa)*sd, oy:Math.sin(sa)*sd,
+          sz:0.4+Math.random()*2.2, phase:Math.random()*Math.PI*2,
+          bright: Math.random()>0.82});
+      }
+    }
+
+    // ─── RENDU ──────────────────────────────────────────────
+
+    // 1. Lueur ambiante très large (halo diffus)
+    const gBg=ctx.createRadialGradient(sx,sy,0,sx,sy,n.r*2.4);
+    gBg.addColorStop(0,`rgba(${r},${g},${b},${0.07+pls*0.025})`);
+    gBg.addColorStop(0.3,`rgba(${r},${g},${b},0.025)`);
+    gBg.addColorStop(0.7,`rgba(${r},${g},${b},0.008)`);
+    gBg.addColorStop(1,'rgba(0,0,0,0)');
+    ctx.beginPath(); ctx.arc(sx,sy,n.r*2.4,0,Math.PI*2); ctx.fillStyle=gBg; ctx.fill();
+
+    // Lueur secondaire (couleur froide, légèrement décalée)
+    const offX=n.r*0.25, offY=n.r*0.15;
+    const gBg2=ctx.createRadialGradient(sx+offX,sy+offY,0,sx+offX,sy+offY,n.r*1.3);
+    gBg2.addColorStop(0,`rgba(${r2c[0]},${r2c[1]},${r2c[2]},0.045)`);
+    gBg2.addColorStop(0.5,`rgba(${r2c[0]},${r2c[1]},${r2c[2]},0.015)`);
+    gBg2.addColorStop(1,'rgba(0,0,0,0)');
+    ctx.beginPath(); ctx.arc(sx+offX,sy+offY,n.r*1.3,0,Math.PI*2); ctx.fillStyle=gBg2; ctx.fill();
+
+    // 2. Blobs nuageux (corps principal multicolore)
+    for(const blob of n._blobs){
+      const bPls=0.5+0.5*Math.sin(_nt*blob.speed+blob.phase);
+      const bx=sx+blob.ox, by=sy+blob.oy;
+      const [br,bg2,bb]=blob.sec?r2c:[r,g,b];
+      const bRad=blob.r*1.35; // rayon élargi pour plus de diffusion
+      const gBlob=ctx.createRadialGradient(bx,by,0,bx,by,bRad);
+      gBlob.addColorStop(0,`rgba(${br},${bg2},${bb},${blob.a*(0.65+bPls*0.25)})`);
+      gBlob.addColorStop(0.3,`rgba(${br},${bg2},${bb},${blob.a*0.35})`);
+      gBlob.addColorStop(0.65,`rgba(${br},${bg2},${bb},${blob.a*0.10})`);
+      gBlob.addColorStop(1,'rgba(0,0,0,0)');
+      ctx.beginPath(); ctx.arc(bx,by,bRad,0,Math.PI*2); ctx.fillStyle=gBlob; ctx.fill();
+    }
+
+    // 3. Filaments gazeux animés
+    ctx.save(); ctx.translate(sx,sy);
+    for(const fil of n._fils){
+      const fa=fil.baseA+Math.sin(_nt*fil.speed+fil.phase)*0.22;
+      const fLen=fil.len*(0.82+Math.sin(_nt*0.45+fil.phase)*0.18);
+      const fW=fil.w*(0.75+Math.sin(_nt*0.55+fil.phase*1.2)*0.25);
+      const ex=Math.cos(fa)*fLen, ey=Math.sin(fa)*fLen;
+      const gFil=ctx.createLinearGradient(0,0,ex,ey);
+      gFil.addColorStop(0,`rgba(${r},${g},${b},0.07)`);
+      gFil.addColorStop(0.45,`rgba(${r},${g},${b},0.028)`);
+      gFil.addColorStop(1,'rgba(0,0,0,0)');
+      ctx.beginPath();
+      ctx.ellipse(ex*0.5,ey*0.5,fLen*0.55,fW*1.3,fa,0,Math.PI*2);
+      ctx.fillStyle=gFil; ctx.fill();
+    }
+    ctx.restore();
+
+    // 4. Couloirs de poussière sombres (dust lanes — élément clé des vraies nébuleuses)
+    ctx.save(); ctx.translate(sx,sy);
+    ctx.lineCap='round';
+    for(const d of n._dust){
+      // Tracé de la bande de poussière comme chemin épais puis rempli avec gradient sombre
+      const mx=(d.x1+d.x2)*0.5+d.cpx*0.5, my=(d.y1+d.y2)*0.5+d.cpy*0.5;
+      const gd=ctx.createRadialGradient(mx,my,0,mx,my,d.w*3);
+      gd.addColorStop(0,`rgba(0,0,0,${d.op})`);
+      gd.addColorStop(0.5,`rgba(0,0,0,${d.op*0.5})`);
+      gd.addColorStop(1,'rgba(0,0,0,0)');
+      ctx.beginPath();
+      ctx.moveTo(d.x1,d.y1);
+      ctx.quadraticCurveTo(d.cpx,d.cpy,d.x2,d.y2);
+      ctx.lineWidth=d.w; ctx.strokeStyle=gd; ctx.stroke();
+    }
+    ctx.restore();
+
+    // 5. Nœuds d'émission brillants (knots — zones de gaz ionisé concentré)
+    for(const kn of n._knots){
+      const kPls=0.45+0.55*Math.abs(Math.sin(_nt*1.1+kn.phase));
+      const kx=sx+kn.ox, ky=sy+kn.oy;
+      const [kr,kg,kb]=kn.hot?[rH,gH,bH]:[r,g,b];
+      const knRad=kn.r*1.6;
+      const gKn=ctx.createRadialGradient(kx,ky,0,kx,ky,knRad);
+      gKn.addColorStop(0,`rgba(${kr},${kg},${kb},${0.40+kPls*0.30})`);
+      gKn.addColorStop(0.25,`rgba(${kr},${kg},${kb},${0.18*kPls})`);
+      gKn.addColorStop(0.65,`rgba(${kr},${kg},${kb},0.03)`);
+      gKn.addColorStop(1,'rgba(0,0,0,0)');
+      ctx.beginPath(); ctx.arc(kx,ky,knRad,0,Math.PI*2); ctx.fillStyle=gKn; ctx.fill();
+    }
+
+    // 6. Noyau central brillant (cœur chaud)
+    const gCore=ctx.createRadialGradient(sx,sy,0,sx,sy,n.r*0.16);
+    gCore.addColorStop(0,`rgba(${rH},${gH},${bH},${0.30+pls*0.18})`);
+    gCore.addColorStop(0.55,`rgba(${r},${g},${b},0.08)`);
+    gCore.addColorStop(1,'rgba(0,0,0,0)');
+    ctx.beginPath(); ctx.arc(sx,sy,n.r*0.16,0,Math.PI*2); ctx.fillStyle=gCore; ctx.fill();
+
+    // 8. Étoiles internes (scintillement + brillantes avec halo)
+    for(const st of n._stars){
+      const stPls=0.25+0.75*Math.abs(Math.sin(_nt*2.1+st.phase));
+      const stx=sx+st.ox, sty=sy+st.oy;
+      if(st.bright){
+        // Étoile brillante : halo coloré + point blanc
+        const sg=ctx.createRadialGradient(stx,sty,0,stx,sty,st.sz*6);
+        sg.addColorStop(0,`rgba(255,255,255,${0.65+stPls*0.35})`);
+        sg.addColorStop(0.25,`rgba(${rH},${gH},${bH},${0.35*stPls})`);
+        sg.addColorStop(1,'rgba(0,0,0,0)');
+        ctx.beginPath(); ctx.arc(stx,sty,st.sz*6,0,Math.PI*2); ctx.fillStyle=sg; ctx.fill();
+        // Petite croix diffraction
+        ctx.save();
+        ctx.strokeStyle=`rgba(255,255,255,${0.35*stPls})`; ctx.lineWidth=0.7;
+        ctx.beginPath(); ctx.moveTo(stx-st.sz*8,sty); ctx.lineTo(stx+st.sz*8,sty); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(stx,sty-st.sz*8); ctx.lineTo(stx,sty+st.sz*8); ctx.stroke();
+        ctx.restore();
+        ctx.beginPath(); ctx.arc(stx,sty,st.sz,0,Math.PI*2);
+        ctx.fillStyle=`rgba(255,255,255,0.95)`; ctx.fill();
+      } else {
+        ctx.beginPath(); ctx.arc(stx,sty,st.sz,0,Math.PI*2);
+        ctx.fillStyle=`rgba(${rH},${gH},${bH},${0.30+stPls*0.60})`; ctx.fill();
+      }
+    }
   }
 }
 
@@ -3601,7 +3833,7 @@ function startBGMusic(){
   const comp=_ac.createDynamicsCompressor();
   comp.threshold.value=-12; comp.knee.value=30;
   comp.ratio.value=6; comp.attack.value=0.05; comp.release.value=0.4;
-  comp.connect(_ac.destination);
+  comp.connect(_nebulaOut||_ac.destination);
   const master=_ac.createGain();
   master.gain.setValueAtTime(0,T);
   master.gain.linearRampToValueAtTime(0.85,T+3);
