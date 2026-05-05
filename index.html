@@ -370,8 +370,14 @@ const meteors=[];
 let meteorDir=1, meteorWarn=0, meteorNotif=0;
 
 // ── Balise de signal ──────────────────────────────────────────────────────
-const BEACON={x:0,y:-2200,r:55,capTeam:null,progress:0,revealTimer:0,revealTeam:null,resetTimer:0};
+const BEACON_ORBIT_R=2200;          // rayon orbital autour de la planète
+const BEACON_ORBIT_SPD=0.00018;     // rad/frame (~1 tour en ~35000 frames ≈ 9 min)
+let   _beaconAngle=Math.PI*1.5;     // angle initial (haut de la planète)
+let   _beaconSelfAngle=0;           // rotation propre du satellite
+const BEACON={x:0,y:-BEACON_ORBIT_R,r:32,capTeam:null,progress:0,contestTeam:null};
 const BEACON_CAP=360;
+const BEACON_MERC_COUNT=10;
+const mercenaries=[]; // mercenaires balise actifs
 
 // ── Épave avec loot rare ──────────────────────────────────────────────────
 let wreckLoot=null, wreckSpawnTimer=1400;
@@ -466,7 +472,8 @@ function makeAsteroid(wx,wy){
     verts.push([Math.cos(a)*r, Math.sin(a)*r]);
   }
   const vx=(Math.random()-0.5)*0.35, vy=(Math.random()-0.5)*0.35;
-  return {wx,wy,radius,verts,vx,vy,rot,rotVel,id:_aId++};
+  const _ahp=rockHp(radius);
+  return {wx,wy,radius,verts,vx,vy,rot,rotVel,id:_aId++,hp:_ahp,maxHp:_ahp};
 }
 const ASTEROIDS=[];
 while(ASTEROIDS.length<220){
@@ -517,6 +524,53 @@ function nearA(x,y){
 }
 // Cap de vitesse en fonction de la masse (r²) — les gros bougent peu
 function aSpeedCap(r){ return Math.max(0.7, 4.5/(r*0.032+0.55)); }
+
+
+// ── HP et éclatement des roches ───────────────────────────────────────────
+function rockHp(r){ return r>=65?4:r>=48?3:r>=34?2:1; }
+function rockSplits(r){ return r>=65?3:r>=48?2:r>=34?1:0; }
+
+function splitAsteroid(a){
+  const n=rockSplits(a.radius);
+  for(let i=0;i<n;i++){
+    const fragR=a.radius*0.52+Math.random()*6;
+    if(fragR<12) continue;
+    const angle=Math.random()*Math.PI*2;
+    const spd=Math.hypot(a.vx,a.vy)*0.55+0.6+Math.random()*0.8;
+    const pts=6+Math.floor(Math.random()*4), verts=[];
+    for(let j=0;j<pts;j++){
+      const fa=(j/pts)*Math.PI*2+(Math.random()-0.5)*0.4;
+      verts.push([Math.cos(fa)*fragR*(0.82+Math.random()*0.2),Math.sin(fa)*fragR*(0.82+Math.random()*0.2)]);
+    }
+    const frag={wx:a.wx+(Math.random()-0.5)*a.radius*0.6,wy:a.wy+(Math.random()-0.5)*a.radius*0.6,
+      radius:fragR,verts,vx:a.vx+Math.cos(angle)*spd,vy:a.vy+Math.sin(angle)*spd,
+      rot:Math.random()*Math.PI*2,rotVel:(Math.random()-0.5)*0.018,id:_aId++};
+    frag.hp=rockHp(frag.radius); frag.maxHp=frag.hp;
+    ASTEROIDS.push(frag);
+  }
+  rebuildAGrid();
+}
+
+function splitMeteor(m, meteors){
+  const n=rockSplits(m.r);
+  for(let i=0;i<n;i++){
+    const fragR=m.r*0.52+Math.random()*4;
+    if(fragR<10) continue;
+    const angle=Math.random()*Math.PI*2;
+    const spd=Math.hypot(m.vx,m.vy)*0.5+0.8+Math.random()*1.2;
+    const pts=6+Math.floor(Math.random()*4), verts=[];
+    for(let j=0;j<pts;j++){
+      const fa=(j/pts)*Math.PI*2+(Math.random()-0.5)*0.4;
+      verts.push([Math.cos(fa)*fragR*(0.82+Math.random()*0.2),Math.sin(fa)*fragR*(0.82+Math.random()*0.2)]);
+    }
+    const frag={x:m.x+(Math.random()-0.5)*m.r*0.6,y:m.y+(Math.random()-0.5)*m.r*0.6,
+      vx:m.vx+Math.cos(angle)*spd,vy:m.vy+Math.sin(angle)*spd,
+      r:fragR,verts,rot:Math.random()*Math.PI*2,rotVel:(Math.random()-0.5)*0.022,
+      life:4000+Math.random()*1000,hitCooldown:0,trail:[]};
+    frag.hp=rockHp(frag.r); frag.maxHp=frag.hp;
+    meteors.push(frag);
+  }
+}
 
 function updateAsteroids(){
   const B=MAP_HALF;
@@ -600,11 +654,12 @@ for(const p of _ALL_SP){
 }
 
 // ── État de partie ────────────────────────────────────────────────────────
-const teamLives={blue:250, red:250};
-const initialLives={blue:250, red:250};
+const teamLives={blue:500, red:500};
+const initialLives={blue:500, red:500};
 let gameOver=null;
 let _playerLives=Infinity; // Pas de limite de vies joueur
-let _score=0, _kills=0, _caps=0;
+let _score=0, _kills=0, _caps=0, _assists=0, _dmgDealt=0;
+let _killStreak=0, _streakTimer=0; // combo kills
 const playerShipType=1; // toujours type 1
 const _hiKey='pewpew_hiscore';
 let _highScore=parseInt(localStorage.getItem(_hiKey)||'0');
@@ -688,6 +743,8 @@ function mkAI(team,shipType=1,startPos=null){
     maxHp:hp,
     empTimer:0, speedBoost:0,
     rallyTarget:null, rallyTimer:0,
+    kills:0, caps:0, dmgDealt:0,
+    beaconSeeker: Math.random()<0.25, // rôle attribué à la création
   };
 }
 const blues=[
@@ -732,7 +789,7 @@ let formationActive=false, formationNotif=0, formationFillTimer=0;
 
 function triggerFormation(){
   if(ship.dead) return;
-  const alive=blues.filter(a=>!a.dead&&a.shipType!==3&&Math.hypot(a.x-ship.x,a.y-ship.y)<2200);
+  const alive=blues.filter(a=>!a.dead&&a.shipType!==3&&!a.isMercenary&&Math.hypot(a.x-ship.x,a.y-ship.y)<2200);
   if(alive.length<2) return;
   alive.sort((a,b)=>Math.hypot(a.x-ship.x,a.y-ship.y)-Math.hypot(b.x-ship.x,b.y-ship.y));
   const count=Math.min(alive.length,FORM_SLOTS.length);
@@ -842,7 +899,7 @@ function asteroidBounce(obj,nearby){
           if(obj.hp<=0&&!obj.dead){
             obj.dead=true; obj.respawnTimer=RESPAWN_FRAMES;
             addExplosion(obj.x,obj.y,obj.team);
-            teamLives[obj.team]--; dropPickup(obj.x,obj.y);
+            if(!obj.isMercenary) teamLives[obj.team]--; dropPickup(obj.x,obj.y);
             playSound('explode',0.55,obj.x,obj.y);
             if(obj===ship) addLog([{text:'JOUEUR',col:teamCol('blue')},{text:' écrasé sur un astéroïde',col:'#888'}]);
             else addLog([{text:obj.name,col:teamCol(obj.team)},{text:' écrasé sur un astéroïde',col:'#888'}]);
@@ -925,6 +982,9 @@ function updateCaptures(){
     sp.capTeam=atkTeam;
     if(atkTeam&&atkN>0&&defN===0){
       const capRate=atkTeam==='red'?atkN*0.35:atkN;
+      // Tracker la contribution du joueur frame par frame
+      const _playerInZone=!ship.dead&&atkTeam==='blue'&&Math.hypot(ship.x-sp.x,ship.y-sp.y)<SPAWN_RADIUS;
+      if(_playerInZone) sp._playerProgress=(sp._playerProgress||0)+(capRate/atkN);
       sp.progress+=capRate;
       if(sp.progress>=CAPTURE_FRAMES){
         const newTeam=atkTeam;
@@ -932,9 +992,17 @@ function updateCaptures(){
         const capper=cappers.length?cappers[0]:null;
         const capName=capper?(capper===ship?'JOUEUR':capper.name):'?';
         const capTeam=capper?(capper===ship?'blue':capper.team):'blue';
-        addLog([{text:capName,col:teamCol(capTeam)},{text:' ⬡ spawn ',col:'#888'},{text:newTeam==='blue'?'bleu':'rouge',col:teamCol(newTeam)}]);
+        addLog([{text:capName,col:teamCol(capTeam)},{text:' capture spawn ',col:'#888'},{text:newTeam==='blue'?'bleu':'rouge',col:teamCol(newTeam)}]);
         sp.team=newTeam;sp.progress=0;sp.capTeam=null;playSound('capture',0.55);
-        if(capper===ship){_score+=200;_caps++;}
+        // Points proportionnels à la contribution réelle du joueur
+        const _playerContrib=sp._playerProgress||0;
+        if(_playerContrib>0){
+          const _capPts=Math.max(50,Math.round(500*_playerContrib/CAPTURE_FRAMES));
+          _score+=_capPts;_caps++;
+          playerFeedback.push({type:'cap',life:100,maxLife:100,label:'SPAWN CAPTURE',pts:`+${_capPts}`});
+        }
+        if(capper&&capper!==ship&&!capper.isMercenary) capper.caps++;
+        sp._playerProgress=0;
       }
     } else if(defN>0&&atkN===0&&sp.progress>0){
       sp.progress=Math.max(0,sp.progress-0.5);
@@ -944,9 +1012,42 @@ function updateCaptures(){
   }
 }
 
+
+// ── Score de kill avec combo ───────────────────────────────────────────────
+function calcKillScore(victim){
+  const base=victim.shipType===3?1000:victim.shipType===2?150:250; // T1 plus dur → +250, T2 plus facile → +150
+  if(_streakTimer>0){ _killStreak++; } else { _killStreak=1; }
+  _streakTimer=360; // 6 sec pour enchaîner
+  const mult=_killStreak>=4?3:_killStreak===3?2:_killStreak===2?1.5:1;
+  const pts=Math.round(base*mult);
+  _score+=pts; _kills++;
+  // Feedback visuel
+  const W=canvas.width, H=canvas.height;
+  const streakLabel=_killStreak>=4?'MASSACRE':_killStreak===3?'TRIPLE KILL':_killStreak===2?'DOUBLE KILL':'KILL';
+  const multLabel=mult>1?` x${mult}`:'';
+  playerFeedback.push({type:'kill',life:110,maxLife:110,label:`${streakLabel}${multLabel}`,pts:`+${pts}`,streak:_killStreak});
+  return pts;
+}
+
 // ── IA ────────────────────────────────────────────────────────────────────
 function updateAI(ai,enemies){
   if(ai.dead){
+    if(ai.isMercenary){
+      // Mercenaire : ne respawn que si la balise est tenue par son équipe
+      if(BEACON.capTeam!==ai.team) return;
+      if(--ai.respawnTimer<=0){
+        const _eAngle=Math.random()*Math.PI*2;
+        const _eR=MAP_RADIUS*0.85+Math.random()*500;
+        ai.x=Math.cos(_eAngle)*_eR; ai.y=Math.sin(_eAngle)*_eR;
+        ai.vx=ai.vy=ai.angVel=0; ai.angle=Math.random()*Math.PI*2;
+        ai.hp=ai.maxHp; ai.dead=false; ai.burstLeft=0; ai.burstTarget=null;
+        ai.shield=ai.maxShield??SHIELD_MAX; ai.shieldTimer=0; ai.shieldHit=0; ai.immuneTimer=SPAWN_IMMUNE;
+        ai.fireTimer=BURST_CD+Math.floor(Math.random()*80);
+        ai.strafeDir=Math.sign(Math.random()-0.5);
+        ai.strafeTimer=20+Math.floor(Math.random()*90);
+      }
+      return;
+    }
     if(--ai.respawnTimer<=0){
       // Type 3 : jamais de respawn
       if(ai.shipType===3) return;
@@ -955,7 +1056,7 @@ function updateAI(ai,enemies){
       const spawnStations=spawns.filter(s=>s.team===ai.team);
       const allSpawnPts=[...t3sp.map(a=>({x:a.x,y:a.y})),...spawnStations];
       if(!allSpawnPts.length) return;
-      const aliveN=(ai.team==='blue'?blues.filter(a=>!a.dead).length+(ship.dead?0:1):reds.filter(a=>!a.dead).length);
+      const aliveN=(ai.team==='blue'?blues.filter(a=>!a.dead&&!a.isMercenary).length+(ship.dead?0:1):reds.filter(a=>!a.dead&&!a.isMercenary).length);
       if(teamLives[ai.team]<=0||teamLives[ai.team]<=aliveN) return;
       const sp=allSpawnPts[Math.floor(Math.random()*allSpawnPts.length)];
       ai.x=sp.x+(Math.random()-0.5)*120; ai.y=sp.y+(Math.random()-0.5)*120;
@@ -996,11 +1097,32 @@ function updateAI(ai,enemies){
   const lx=ai.x+ai.vx*28, ly=ai.y+ai.vy*28;
   let repX=0, repY=0;
   const nearby=nearA(ai.x,ai.y);
+  // Répulsion astéroïdes (position actuelle et prédite)
   for(const a of nearby){
     const d1=Math.hypot(ai.x-a.wx,ai.y-a.wy), d2=Math.hypot(lx-a.wx,ly-a.wy);
     const d=Math.min(d1,d2), px=d1<d2?ai.x:lx, py=d1<d2?ai.y:ly;
     const danger=a.radius+115;
     if(d<danger&&d>0.1){const str=Math.pow((danger-d)/danger,1.5)*3;repX+=(px-a.wx)/d*str;repY+=(py-a.wy)/d*str;}
+  }
+  // Répulsion météores — même logique, position prédite du météore aussi
+  for(const m of meteors){
+    const LOOK=28;
+    // Position prédite du météore dans LOOK frames
+    const mx2=m.x+m.vx*LOOK, my2=m.y+m.vy*LOOK;
+    // Position prédite de l'IA dans LOOK frames
+    const d1=Math.hypot(ai.x-m.x,ai.y-m.y);
+    const d2=Math.hypot(lx-m.x,ly-m.y);
+    const d3=Math.hypot(ai.x-mx2,ai.y-my2);
+    const d4=Math.hypot(lx-mx2,ly-my2);
+    const d=Math.min(d1,d2,d3,d4);
+    // Point de référence : combinaison la plus proche
+    let rpx,rpy,rmx,rmy;
+    if(d===d1){rpx=ai.x;rpy=ai.y;rmx=m.x;rmy=m.y;}
+    else if(d===d2){rpx=lx;rpy=ly;rmx=m.x;rmy=m.y;}
+    else if(d===d3){rpx=ai.x;rpy=ai.y;rmx=mx2;rmy=my2;}
+    else{rpx=lx;rpy=ly;rmx=mx2;rmy=my2;}
+    const danger=m.r+115;
+    if(d<danger&&d>0.1){const str=Math.pow((danger-d)/danger,1.5)*4;repX+=(rpx-rmx)/d*str;repY+=(rpy-rmy)/d*str;}
   }
   // Répulsion douce entre vaisseaux (évite le chevauchement sans collision dure)
   const minSep=SHIP_RADIUS*3.2;
@@ -1068,6 +1190,11 @@ function updateAI(ai,enemies){
   );
 
   const wantPickup=pkTgt&&repStr<1&&(!target||tDist>300||ai.hp===1);
+  // Attraction vers la balise : bots désignés "seekers" vont capturer/défendre
+  const _beaconDist=Math.hypot(ai.x-BEACON.x,ai.y-BEACON.y);
+  const wantBeacon=ai.beaconSeeker&&ai.shipType!==3&&!ai.isMercenary&&repStr<1
+    &&(BEACON.capTeam!==ai.team||BEACON.contestTeam!==null)
+    &&(!target||tDist>700)&&_beaconDist<8000;
 
   // Formation d'escorte autour du joueur (bleus)
   let wantForm=false;
@@ -1089,6 +1216,13 @@ function updateAI(ai,enemies){
     }
   }
   else if(wantPickup){desAngle=Math.atan2(pkTgt.y-ai.y,pkTgt.x-ai.x);}
+  else if(wantBeacon){
+    // Dans la zone → viser ennemis proches, sinon foncer vers la balise
+    if(_beaconDist<220&&target&&tDist<FIRE_RANGE){
+      const t3=Math.min(tDist/BULLET_SPEED,45);
+      desAngle=Math.atan2(target.y+target.vy*t3-ai.y,target.x+target.vx*t3-ai.x);
+    } else { desAngle=Math.atan2(BEACON.y-ai.y,BEACON.x-ai.x); }
+  }
   else if(wantEscort&&!target){
     const _slot=T3_ESCORT_SLOTS[ai.escortSlot];
     const _cosL=Math.cos(_t3leader.angle),_sinL=Math.sin(_t3leader.angle);
@@ -1137,9 +1271,15 @@ function updateAI(ai,enemies){
     }
   }
   // ── Patrouille : dispersion sur la map quand pas d'objectif ───────────────
-  const _idle=!target&&!wantCap&&!wantPickup&&!wantForm&&repStr<0.5&&!ai.rallyTarget;
+  const _idle=!target&&!wantCap&&!wantPickup&&!wantForm&&!wantBeacon&&repStr<0.5&&!ai.rallyTarget;
   if(_idle){
     const _pd=Math.hypot(ai.x-ai.patrolX,ai.y-ai.patrolY);
+    // Beacon seeker idle : patrouiller autour de la balise si proche
+    if(ai.beaconSeeker&&_beaconDist<1200){
+      const _ba=Math.random()*Math.PI*2;
+      ai.patrolX=BEACON.x+Math.cos(_ba)*300; ai.patrolY=BEACON.y+Math.sin(_ba)*300;
+      ai.patrolTimer=300+Math.floor(Math.random()*200);
+    }
     if(_pd<350||--ai.patrolTimer<=0){
       if(ai.shipType===3&&eSpawns.length){
         // Type 3 : fonce vers un spawn ennemi, en évitant la planète
@@ -1304,6 +1444,7 @@ function updateSpawnTurrets(){
       // Position physique de cette tourelle
       const tx=sp.x+Math.cos(tr.offsetAngle)*(tr.offsetRadius||0);
       const ty=sp.y+Math.sin(tr.offsetAngle)*(tr.offsetRadius||0);
+      // Tracking angulaire vers l'ennemi le plus proche
       let nearest=null,nearDist=TURRET_RANGE;
       for(const f of foes){
         if(f.dead) continue;
@@ -1312,15 +1453,19 @@ function updateSpawnTurrets(){
       }
       if(nearest){
         let da=Math.atan2(nearest.y-ty,nearest.x-tx)-tr.angle;
-        while(da>Math.PI)da-=Math.PI*2;while(da<-Math.PI)da+=Math.PI*2;
+        while(da>Math.PI)da-=Math.PI*2; while(da<-Math.PI)da+=Math.PI*2;
         tr.angle+=Math.sign(da)*Math.min(Math.abs(da),0.055);
+      }
+      if(nearest){
         if(tr.offsetRadius===0){
           // Tourelle centrale : laser type 3
           if(--tr.fireTimer<=0){
             tr.fireTimer=90+Math.floor(Math.random()*20);
             if(lasers.length<MAX_LASERS){
               const _msh={x:tx,y:ty,angle:tr.angle,dead:false,name:'STATION',team:sp.team,shipType:3};
-              lasers.push({shooter:_msh,target:nearest,team:sp.team,side:'center',
+              // cible fictive dans la direction courante
+              const _fakeTarget={x:tx+Math.cos(tr.angle)*800,y:ty+Math.sin(tr.angle)*800,dead:false};
+              lasers.push({shooter:_msh,target:_fakeTarget,team:sp.team,side:'center',
                 life:TYPE3_LASER_LIFE,maxLife:TYPE3_LASER_LIFE,dmgTimer:0,owner:null,_station:true});
               sfxShoot(tx,ty);
             }
@@ -1332,7 +1477,7 @@ function updateSpawnTurrets(){
               if(bullets.length<MAX_BULLETS){
                 bullets.push({x:tx+Math.cos(tr.angle)*18,y:ty+Math.sin(tr.angle)*18,
                   vx:Math.cos(tr.angle)*BULLET_SPEED,vy:Math.sin(tr.angle)*BULLET_SPEED,
-                  team:sp.team,life:BULLET_LIFE,target:nearest,shooter:{name:'TOURELLE',team:sp.team},
+                  team:sp.team,life:BULLET_LIFE,target:null,shooter:{name:'TOURELLE',team:sp.team},
                   wx:tx,wy:ty,homing:false});
                 sfxShoot(tx,ty);
               }
@@ -1367,26 +1512,47 @@ function updateWorldSystems(){
         const t=-MAP_HALF*0.7+i*(MAP_HALF*1.4/34);
         const spd=4.5+Math.random()*3;
         const jitter=(Math.random()-0.5)*400;
-        meteors.push({
-          x:Math.cos(ang)*MAP_HALF*1.05+px*(t+jitter),
-          y:Math.sin(ang)*MAP_HALF*1.05+py*(t+jitter),
-          vx:vx0*spd+px*(Math.random()-0.5)*1.5,
-          vy:vy0*spd+py*(Math.random()-0.5)*1.5,
-          r:20+Math.random()*35,life:6000,hitCooldown:0,trail:[]
-        });
+        {
+          const _mr=20+Math.random()*35;
+          const _mpts=7+Math.floor(Math.random()*5), _mverts=[];
+          for(let _mi=0;_mi<_mpts;_mi++){
+            const _ma=(_mi/_mpts)*Math.PI*2+(Math.random()-0.5)*0.38;
+            const _mrr=_mr*(0.82+Math.random()*0.22);
+            _mverts.push([Math.cos(_ma)*_mrr,Math.sin(_ma)*_mrr]);
+          }
+          meteors.push({
+            x:Math.cos(ang)*MAP_HALF*1.05+px*(t+jitter),
+            y:Math.sin(ang)*MAP_HALF*1.05+py*(t+jitter),
+            vx:vx0*spd+px*(Math.random()-0.5)*1.5,
+            vy:vy0*spd+py*(Math.random()-0.5)*1.5,
+            r:_mr, verts:_mverts,
+            rot:Math.random()*Math.PI*2,
+            rotVel:(Math.random()-0.5)*0.018,
+            life:6000,hitCooldown:0,trail:[],
+            hp:rockHp(_mr),maxHp:rockHp(_mr)
+          });
+        }
       }
     }
   }
   for(let i=meteors.length-1;i>=0;i--){
     const m=meteors[i];
     m.x+=m.vx; m.y+=m.vy; m.life--;
+    // Rotation et friction (comme astéroïde)
+    if(m.rot!==undefined){ m.rot+=m.rotVel; m.rotVel*=0.999; }
+    m.vx*=0.999; m.vy*=0.999;
     if(m.hitCooldown>0) m.hitCooldown--;
-    // Traînée : enregistrement de la position réelle à chaque déplacement
+    // Traînée : longueur proportionnelle à la vitesse (invisible si quasi-immobile)
     if(!m.trail) m.trail=[];
+    const _mspd=Math.hypot(m.vx,m.vy);
+    const _maxTrail=Math.floor(_mspd*6); // 0 pts à vitesse nulle, ~55 pts à v=9
     const _lt=m.trail[0];
-    if(!_lt||Math.hypot(m.x-_lt.x,m.y-_lt.y)>2){
+    if(_mspd>0.4&&(!_lt||Math.hypot(m.x-_lt.x,m.y-_lt.y)>2)){
       m.trail.unshift({x:m.x,y:m.y});
-      if(m.trail.length>55) m.trail.pop();
+      if(m.trail.length>_maxTrail) m.trail.length=_maxTrail;
+    } else if(_mspd<=0.4){
+      // Quasi-immobile : vider progressivement la traînée
+      if(m.trail.length>0) m.trail.pop();
     }
     // Sortie de la map circulaire (l'autre côté)
     if(m.life<=0||Math.hypot(m.x,m.y)>MAP_HALF*1.3){meteors.splice(i,1);continue;}
@@ -1410,16 +1576,19 @@ function updateWorldSystems(){
         const anx=(m.x-a.wx)/ad, any=(m.y-a.wy)/ad;
         const relVx=m.vx-a.vx, relVy=m.vy-a.vy;
         const relV=relVx*anx+relVy*any;
-        if(relV<0){ // approche
-          // Le météore est massif : déviation légère
-          m.vx-=anx*relV*0.08; m.vy-=any*relV*0.08;
-          // L'astéroïde est éjecté plus fort
-          const push=-relV*2.8/(a.radius*0.04+0.6);
-          a.vx+=anx*push; a.vy+=any*push;
-          const aSpd=Math.hypot(a.vx,a.vy), aCap2=aSpeedCap(a.radius)*1.4;
+        if(relV<0){ // approche — collision élastique avec rapports de masse
+          const mM=m.r*m.r, aM=a.radius*a.radius, mT=mM+aM, e=0.65;
+          const dvM=-(1+e)*aM/mT*relV;
+          const dvA= (1+e)*mM/mT*relV;
+          m.vx+=anx*dvM; m.vy+=any*dvM;
+          a.vx-=anx*dvA; a.vy-=any*dvA;
+          const aSpd=Math.hypot(a.vx,a.vy), aCap2=aSpeedCap(a.radius)*1.6;
           if(aSpd>aCap2){a.vx=a.vx/aSpd*aCap2;a.vy=a.vy/aSpd*aCap2;}
-          a.rotVel+=(-any*(m.vx-a.vx)+anx*(m.vy-a.vy))*0.002/(a.radius*0.04+0.5);
-          // Séparer pour éviter l'imbrication
+          // Rotation de l'astéroïde + du météore
+          const tang=(-any*(m.vx-a.vx)+anx*(m.vy-a.vy));
+          a.rotVel+=tang*0.0015/(a.radius*0.04+0.5);
+          if(m.rotVel!==undefined) m.rotVel+=tang*0.0008/(m.r*0.04+0.5);
+          // Séparation
           m.x=a.wx+anx*(m.r+a.radius*0.72+1); m.y=a.wy+any*(m.r+a.radius*0.72+1);
           addSpark(m.x,m.y,'blue');
           if(_astSfxThrottle===0){playSound('shield',0.18,m.x,m.y);_astSfxThrottle=8;}
@@ -1451,7 +1620,7 @@ function updateWorldSystems(){
           if(s.hp<=0&&!s.dead){
             s.dead=true; s.respawnTimer=RESPAWN_FRAMES;
             addExplosion(s.x,s.y,s.team);
-            teamLives[s.team]--; dropPickup(s.x,s.y);
+            if(!s.isMercenary) teamLives[s.team]--; dropPickup(s.x,s.y);
             playSound('explode',0.55,s.x,s.y);
             if(s===ship){
               _playerLives--;
@@ -1487,27 +1656,52 @@ function updateWorldSystems(){
     }
   }
   // ─ Balise de signal ─
-  if(BEACON.resetTimer>0){
-    BEACON.resetTimer--;
-    if(BEACON.resetTimer===0){BEACON.capTeam=null;BEACON.progress=0;}
-  }
-  if(BEACON.revealTimer>0) BEACON.revealTimer--;
-  if(BEACON.resetTimer===0){
-    const nearShips=[...blues,...reds,...(ship.dead?[]:[ship])].filter(s=>!s.dead&&Math.hypot(s.x-BEACON.x,s.y-BEACON.y)<200);
-    if(nearShips.length>0){
-      const t=nearShips[0].team;
-      const allSame=nearShips.every(s=>s.team===t);
-      if(allSame){
-        if(BEACON.capTeam!==t){BEACON.capTeam=t;BEACON.progress=0;}
-        BEACON.progress+=nearShips.length*0.6;
-        if(BEACON.progress>=BEACON_CAP){
-          BEACON.revealTimer=1800; BEACON.revealTeam=t;
-          BEACON.progress=BEACON_CAP; BEACON.resetTimer=900;
-          addLog([{text:t==='blue'?'BLEUS':'ROUGES',col:teamCol(t)},{text:' capturent la balise ! Radar ×3 30s',col:'#ffdd44'}]);
-          playSound('respawn',0.4);
+  // Orbite autour de la planète centrale
+  _beaconAngle+=BEACON_ORBIT_SPD;
+  BEACON.x=PLANET.x+Math.cos(_beaconAngle)*BEACON_ORBIT_R;
+  BEACON.y=PLANET.y+Math.sin(_beaconAngle)*BEACON_ORBIT_R;
+  // Rotation propre du satellite
+  _beaconSelfAngle+=0.004;
+  // Capture station-like : contestation/possession permanente
+  {
+    const _bNear=[...blues,...reds,...(ship.dead?[]:[ship])].filter(s=>!s.dead&&Math.hypot(s.x-BEACON.x,s.y-BEACON.y)<200);
+    if(_bNear.length>0){
+      const _bt=_bNear[0].team;
+      const _bSame=_bNear.every(s=>s.team===_bt);
+      if(_bSame){
+        if(BEACON.capTeam===_bt){
+          // Déjà possédé par cette équipe → stable, pas d'action
+        } else {
+          // Contestation ou capture neutre
+          BEACON.contestTeam=_bt;
+          if(_bt==='blue'&&!ship.dead&&Math.hypot(ship.x-BEACON.x,ship.y-BEACON.y)<200){
+            BEACON._playerProgress=(BEACON._playerProgress||0)+0.6/_bNear.length;
+          }
+          BEACON.progress+=_bNear.length*0.6;
+          if(BEACON.progress>=BEACON_CAP){
+            BEACON.capTeam=_bt; BEACON.contestTeam=null; BEACON.progress=0;
+            spawnMercenaries(_bt);
+            if(!ship.dead&&_bt==='blue'){
+            const _satPts=Math.hypot(ship.x-BEACON.x,ship.y-BEACON.y)<400?Math.max(80,Math.round(500*(BEACON._playerProgress||0)/BEACON_CAP)):0;
+            if(_satPts>0){_score+=_satPts;_caps++;playerFeedback.push({type:'cap',life:120,maxLife:120,label:'SATELLITE CAPTURE',pts:`+${_satPts}`});}
+          }
+          BEACON._playerProgress=0;
+            addLog([{text:_bt==='blue'?'BLEUS':'ROUGES',col:teamCol(_bt)},{text:' prennent le satellite ! 10 mercenaires deployes !',col:'#ffdd44'}]);
+            playSound('respawn',0.4);
+          }
         }
-      } else { BEACON.progress=Math.max(0,BEACON.progress-0.8); }
-    } else { BEACON.progress=Math.max(0,BEACON.progress-0.3); }
+      } else {
+        // Équipes mixtes → pas de progrès
+        BEACON.progress=Math.max(0,BEACON.progress-0.8);
+        if(BEACON.progress===0) BEACON.contestTeam=null;
+      }
+    } else {
+      // Personne à proximité → léger retour vers neutre si contesté
+      if(BEACON.contestTeam){
+        BEACON.progress=Math.max(0,BEACON.progress-0.25);
+        if(BEACON.progress===0) BEACON.contestTeam=null;
+      }
+    }
   }
   // ─ Épave & loot rare ─
   if(wreckLoot===null){
@@ -1560,7 +1754,7 @@ function applyGravity(obj, isBullet){
       if(obj.hp<=0&&!obj.dead){
         obj.dead=true; obj.respawnTimer=RESPAWN_FRAMES;
         addExplosion(obj.x,obj.y,obj.team);
-        teamLives[obj.team]--; dropPickup(obj.x,obj.y);
+        if(!obj.isMercenary) teamLives[obj.team]--; dropPickup(obj.x,obj.y);
         playSound('explode',0.55,obj.x,obj.y);
         if(obj===ship){
           _playerLives--;
@@ -1582,6 +1776,7 @@ function applyGravity(obj, isBullet){
 function update(){
   if(gameOver) return;
   _gameTick++;
+  if(_streakTimer>0) _streakTimer--;
   // ── Marqueurs de rally (minimap) ─────────────────────────────────────────
   for(let _ri=_rallyMarkers.length-1;_ri>=0;_ri--){_rallyMarkers[_ri].life--;if(_rallyMarkers[_ri].life<=0)_rallyMarkers.splice(_ri,1);}
   if(_rallyNotif){_rallyNotif.life--;if(_rallyNotif.life<=0)_rallyNotif=null;}
@@ -1671,6 +1866,20 @@ function update(){
     }
   }
   // ── Tension musicale ─────────────────────────────────────────────────────
+  // ── Soin station : ships alliés dans la zone récupèrent 1 HP / 4s ──────
+  if(_gameTick%240===0&&_gameTick>0){
+    for(const sp of spawns){
+      if(sp.team==='neutral') continue;
+      const _healR=SPAWN_RADIUS*1.6;
+      const _healShips=[...(sp.team==='blue'?[...blues,...(ship.dead?[]:[ship])]:reds)]
+        .filter(a=>!a.dead&&a.team===sp.team&&Math.hypot(a.x-sp.x,a.y-sp.y)<_healR);
+      for(const h of _healShips){
+        if(h.hp<h.maxHp) h.hp=Math.min(h.maxHp,h.hp+1);
+        const _hShMax=h.maxShield??SHIELD_MAX;
+        if(h.shield<_hShMax){ h.shield=Math.min(_hShMax,h.shield+3); h.shieldTimer=0; }
+      }
+    }
+  }
   if(_gameTick%60===0&&_gameStarted){
     const _nearEn=reds.filter(r=>!r.dead&&Math.hypot(r.x-ship.x,r.y-ship.y)<1400).length;
     const _hpRatio=ship.dead?0:ship.hp/(ship.maxHp||PLAYER_HP);
@@ -1681,13 +1890,7 @@ function update(){
     const _targetT=Math.min(1,_nearEn/7+_lowHp+_t3Threat+_rallyBonus);
     _musicTension+=(_targetT-_musicTension)*0.12; // lissage
   }
-  // ── Revenu de tickets : 1 ticket / spawner possédé toutes les 5s ──────────
-  if(_gameTick%1200===0&&_gameTick>0){
-    for(const sp of spawns){
-      if(sp.team==='blue') teamLives.blue++;
-      else if(sp.team==='red') teamLives.red++;
-    }
-  }
+  // Revenu de tickets supprimé (option A — pas de snowball spawn)
   const _wasShipAlive=!ship.dead;
   if(_astSfxThrottle>0) _astSfxThrottle--;
 
@@ -1727,6 +1930,7 @@ function update(){
 
     // Tir automatique joueur : parmi les ennemis à portée, choisir le mieux aligné
     let pTgt=null, pTDist=Infinity, pBestAfd=Infinity;
+    // Vaisseaux ennemis
     for(const e of reds){
       if(e.dead) continue;
       const d=Math.hypot(e.x-ship.x,e.y-ship.y);
@@ -1735,9 +1939,20 @@ function update(){
       let fd=Math.atan2(e.y+e.vy*t2-ship.y,e.x+e.vx*t2-ship.x)-ship.angle;
       while(fd>Math.PI)fd-=Math.PI*2; while(fd<-Math.PI)fd+=Math.PI*2;
       const afd=Math.abs(fd);
-      // Priorité : arc de tir d'abord, puis distance
       if(pTgt===null||afd<pBestAfd||(afd<0.30&&d<pTDist)){
         pTgt=e; pTDist=d; pBestAfd=afd;
+      }
+    }
+    // Tourelles ennemies (stations rouges avec tourelles vivantes)
+    for(const sp of spawns){
+      if(sp.team!=='red'||!sp.turrets.some(t=>t.hp>0)) continue;
+      const d=Math.hypot(sp.x-ship.x,sp.y-ship.y);
+      if(d>=FIRE_RANGE) continue;
+      let fd=Math.atan2(sp.y-ship.y,sp.x-ship.x)-ship.angle;
+      while(fd>Math.PI)fd-=Math.PI*2; while(fd<-Math.PI)fd+=Math.PI*2;
+      const afd=Math.abs(fd);
+      if(pTgt===null||afd<pBestAfd||(afd<0.30&&d<pTDist)){
+        pTgt=sp; pTDist=d; pBestAfd=afd;
       }
     }
     if(ship.burstLeft>0){
@@ -1846,8 +2061,9 @@ function update(){
         if(!takeHit(e)){
           e.hp--; e.hit=10;
           if(e.hp<=0){
-            e.dead=true;e.respawnTimer=RESPAWN_FRAMES;addExplosion(e.x,e.y,e.team);teamLives[e.team]--;dropPickup(e.x,e.y);playSound('explode',0.55,e.x,e.y);
-            if(wasPlayer){ _score+=100; _kills++; playerFeedback.push({type:'kill',life:90,maxLife:90}); }
+            e.dead=true;e.respawnTimer=RESPAWN_FRAMES;addExplosion(e.x,e.y,e.team);if(!e.isMercenary)teamLives[e.team]--;dropPickup(e.x,e.y);playSound('explode',0.55,e.x,e.y);
+            if(wasPlayer){ calcKillScore(e); _dmgDealt+=e.maxHp; }
+            else if(b.shooter&&!b.shooter.isMercenary){ b.shooter.kills++; b.shooter.dmgDealt+=e.maxHp; }
             const sn=b.shooter?.name||'?';
             addLog([{text:sn,col:teamCol(b.team)},{text:' ✕ ',col:'#888'},{text:e.name,col:teamCol(e.team)}]);
             if(e.formSlot!==undefined){
@@ -1855,8 +2071,8 @@ function update(){
               formationFillTimer=300;
             }
           } else if(wasPlayer){
-            _score+=10;
-            playerFeedback.push({type:'hit',life:50,maxLife:50});
+            _score+=8; _dmgDealt+=1;
+            playerFeedback.push({type:'hit',life:40,maxLife:40});
           }
         } else if(wasPlayer){
           playerFeedback.push({type:'hit',life:50,maxLife:50});
@@ -1906,23 +2122,39 @@ function update(){
         a.vx+=b.vx*push; a.vy+=b.vy*push;
         const aSpd=Math.hypot(a.vx,a.vy), aBCap=aSpeedCap(a.radius);
         if(aSpd>aBCap){a.vx=a.vx/aSpd*aBCap;a.vy=a.vy/aSpd*aBCap;}
-        // Rotation due au tir (point d'impact excentré)
         const idx=b.x-a.wx, idy=b.y-a.wy, id=Math.hypot(idx,idy)||1;
         a.rotVel+=(idx/id*b.vy-idy/id*b.vx)*0.0025/(a.radius*0.04+0.5);
         const maxRot=0.12; if(Math.abs(a.rotVel)>maxRot) a.rotVel=Math.sign(a.rotVel)*maxRot;
+        // Dégâts HP
+        if(a.hp===undefined){a.hp=rockHp(a.radius);a.maxHp=a.hp;}
+        a.hp--;
+        if(a.hp<=0){
+          addExplosion(a.wx,a.wy,'blue');
+          splitAsteroid(a);
+          ASTEROIDS.splice(ASTEROIDS.indexOf(a),1);
+          rebuildAGrid();
+        }
         astHit=true;break;
       }
     }
     if(astHit){bullets.splice(i,1);continue;}
     // Météores — les balles les dévient mais ne les détruisent pas
     let metHit=false;
-    for(const m of meteors){
+    for(let _mi=meteors.length-1;_mi>=0;_mi--){
+      const m=meteors[_mi];
       if(Math.hypot(b.x-m.x,b.y-m.y)<m.r){
         addSpark(b.x,b.y,b.team);
-        // Légère déviation du météore par l'impact
         const bd=Math.hypot(b.x-m.x,b.y-m.y)||0.01;
         const bnx=(m.x-b.x)/bd, bny=(m.y-b.y)/bd;
         m.vx+=bnx*0.25; m.vy+=bny*0.25;
+        m.rotVel+=(bnx*b.vy-bny*b.vx)*0.003/(m.r*0.04+0.5);
+        if(m.hp===undefined){m.hp=rockHp(m.r);m.maxHp=m.hp;}
+        m.hp--;
+        if(m.hp<=0){
+          addExplosion(m.x,m.y,'blue');
+          splitMeteor(m,meteors);
+          meteors.splice(_mi,1);
+        }
         metHit=true; break;
       }
     }
@@ -1971,11 +2203,12 @@ function update(){
                 _le.hp--; _le.hit=10;
                 if(_le.hp<=0){
                   _le.dead=true;_le.respawnTimer=RESPAWN_FRAMES;
-                  addExplosion(_le.x,_le.y,_le.team);teamLives[_le.team]--;
+                  addExplosion(_le.x,_le.y,_le.team);if(!_le.isMercenary)teamLives[_le.team]--;
                   dropPickup(_le.x,_le.y);playSound('explode',0.55,_le.x,_le.y);
-                  if(_lwp){_score+=100;_kills++;playerFeedback.push({type:'kill',life:90,maxLife:90});}
+                  if(_lwp){calcKillScore(_le);_dmgDealt+=_le.maxHp;}
+                  else if(_lsh&&!_lsh.isMercenary&&!_lsh._station){_lsh.kills++;_lsh.dmgDealt+=_le.maxHp;}
                   addLog([{text:_lsh.name||'?',col:teamCol(_lz.team)},{text:' ✕ ',col:'#888'},{text:_le.name||'JOUEUR',col:teamCol(_le.team)}]);
-                } else if(_lwp){_score+=10;playerFeedback.push({type:'hit',life:50,maxLife:50});}
+                } else if(_lwp){_score+=8;_dmgDealt+=1;playerFeedback.push({type:'hit',life:40,maxLife:40});}
               } else if(_lwp){playerFeedback.push({type:'hit',life:50,maxLife:50});}
             }
           }
@@ -2040,8 +2273,8 @@ function update(){
   const sB=spawns.filter(s=>s.team==='blue').length;
   const sR=spawns.filter(s=>s.team==='red').length;
   // Partie terminée seulement quand tous les survivants sont morts
-  const redAliveAny=reds.some(a=>!a.dead);
-  const blueAliveAny=blues.some(a=>!a.dead)||!ship.dead;
+  const redAliveAny=reds.some(a=>!a.dead&&!a.isMercenary);
+  const blueAliveAny=blues.some(a=>!a.dead&&!a.isMercenary)||!ship.dead;
   if(!redAliveAny) gameOver='blue';
   if(!blueAliveAny) gameOver='red';
 }
@@ -2203,13 +2436,15 @@ function drawMeteors(){
     }
     const sx=m.x-_camX+cx, sy=m.y-_camY+cy;
     if(sx<-CULL_MG||sx>canvas.width+CULL_MG||sy<-CULL_MG||sy>canvas.height+CULL_MG) continue;
-    // ── Corps rocheux ────────────────────────────────────────────────────
+    // ── Corps rocheux (polygone avec rotation, physique astéroïde) ──────
     ctx.save(); ctx.translate(sx,sy);
-    const pts=m._pts||(()=>{
+    const _mRot=m.rot||0;
+    const pts=m.verts||(()=>{
       const p=[]; const n=7+Math.floor(Math.random()*3);
       for(let i=0;i<n;i++){const a=i/n*Math.PI*2+(Math.random()-0.5)*0.5;p.push([Math.cos(a)*m.r*(0.65+Math.random()*0.42),Math.sin(a)*m.r*(0.65+Math.random()*0.42)]);}
-      m._pts=p; return p;
+      m.verts=p; return p;
     })();
+    ctx.rotate(_mRot);
     ctx.beginPath(); ctx.moveTo(pts[0][0],pts[0][1]);
     for(let i=1;i<pts.length;i++) ctx.lineTo(pts[i][0],pts[i][1]);
     ctx.closePath();
@@ -2230,39 +2465,92 @@ function drawMeteors(){
   }
 }
 
+
+// ── Mercenaires balise ────────────────────────────────────────────────────────
+function spawnMercenaries(team){
+  // Tuer les anciens mercenaires (quelle que soit leur équipe)
+  for(const m of mercenaries){ m.dead=true; m.respawnTimer=999999; }
+  mercenaries.length=0;
+  for(let i=0;i<BEACON_MERC_COUNT;i++){
+    const edgeAngle=Math.random()*Math.PI*2;
+    const edgeR=MAP_RADIUS*0.85+Math.random()*MAP_RADIUS*0.08;
+    const pos={x:Math.cos(edgeAngle)*edgeR, y:Math.sin(edgeAngle)*edgeR};
+    const ai=mkAI(team,2,pos);
+    ai.isMercenary=true;
+    mercenaries.push(ai);
+    if(team==='blue') blues.push(ai); else reds.push(ai);
+  }
+}
+
 function drawBeacon(){
-  if(BEACON.resetTimer>0&&BEACON.revealTimer<=0) return;
   const cx=canvas.width/2, cy=canvas.height/2;
   const sx=BEACON.x-_camX+cx, sy=BEACON.y-_camY+cy;
-  const pls=0.5+0.5*Math.sin(Date.now()*0.003);
-  // Anneau pulsant
-  ctx.beginPath(); ctx.arc(sx,sy,BEACON.r+12+pls*8,0,Math.PI*2);
-  ctx.strokeStyle=BEACON.capTeam?`rgba(${BEACON.capTeam==='blue'?'80,160,255':'255,80,60'},${0.5+pls*0.3})`:'rgba(200,200,255,0.35)';
-  ctx.lineWidth=2; ctx.stroke();
-  // Corps hexagonal
-  ctx.save(); ctx.translate(sx,sy); ctx.rotate(Date.now()*0.0008);
-  ctx.beginPath();
-  for(let i=0;i<6;i++){const a=i*Math.PI/3;ctx.lineTo(Math.cos(a)*BEACON.r,Math.sin(a)*BEACON.r);}
-  ctx.closePath();
-  const bc=BEACON.capTeam==='blue'?'rgba(40,100,220,0.55)':BEACON.capTeam==='red'?'rgba(200,60,40,0.55)':'rgba(80,60,160,0.45)';
-  ctx.fillStyle=bc; ctx.fill();
-  ctx.strokeStyle='rgba(200,200,255,0.7)'; ctx.lineWidth=1.5; ctx.stroke();
-  ctx.restore();
-  // Icône
-  ctx.fillStyle='rgba(220,220,255,0.9)'; ctx.font='bold 14px monospace'; ctx.textAlign='center';
-  ctx.fillText('📡',sx,sy+5); ctx.textAlign='left';
-  // Barre de capture
-  if(BEACON.progress>0&&BEACON.resetTimer===0){
-    const bw=80;
-    ctx.fillStyle='rgba(0,0,30,0.7)'; ctx.fillRect(sx-bw/2,sy-BEACON.r-22,bw,8);
-    ctx.fillStyle=BEACON.capTeam==='blue'?'#4aadff':'#ff6050';
-    ctx.fillRect(sx-bw/2,sy-BEACON.r-22,bw*(BEACON.progress/BEACON_CAP),8);
+  if(sx<-200||sx>canvas.width+200||sy<-200||sy>canvas.height+200) return;
+  const pls=0.5+0.5*Math.sin(Date.now()*0.0025);
+  const teamRGB=BEACON.capTeam==='blue'?'80,160,255':BEACON.capTeam==='red'?'255,80,60':'180,160,255';
+  // ── Lueur orbitale ──
+  const glow=ctx.createRadialGradient(sx,sy,0,sx,sy,55+pls*10);
+  glow.addColorStop(0,`rgba(${teamRGB},${0.18+pls*0.1})`);
+  glow.addColorStop(1,'rgba(0,0,0,0)');
+  ctx.beginPath(); ctx.arc(sx,sy,55+pls*10,0,Math.PI*2); ctx.fillStyle=glow; ctx.fill();
+  // ── Corps du satellite ──
+  ctx.save(); ctx.translate(sx,sy); ctx.rotate(_beaconSelfAngle);
+  // Panneaux solaires gauche
+  ctx.fillStyle=BEACON.capTeam==='blue'?'#0a2860':BEACON.capTeam==='red'?'#5a0a08':'#1a1640';
+  ctx.strokeStyle=BEACON.capTeam==='blue'?'#2060d0':BEACON.capTeam==='red'?'#c03020':'#5040a0';
+  ctx.lineWidth=1.2;
+  ctx.fillRect(-58,-8,38,16); ctx.strokeRect(-58,-8,38,16);
+  // Grille panneau gauche
+  ctx.strokeStyle=`rgba(${teamRGB},0.35)`; ctx.lineWidth=0.6;
+  for(let i=1;i<4;i++){ctx.beginPath();ctx.moveTo(-58+i*9.5,-8);ctx.lineTo(-58+i*9.5,8);ctx.stroke();}
+  ctx.beginPath();ctx.moveTo(-58,0);ctx.lineTo(-20,0);ctx.stroke();
+  // Panneaux solaires droit
+  ctx.fillStyle=BEACON.capTeam==='blue'?'#0a2860':BEACON.capTeam==='red'?'#5a0a08':'#1a1640';
+  ctx.strokeStyle=BEACON.capTeam==='blue'?'#2060d0':BEACON.capTeam==='red'?'#c03020':'#5040a0';
+  ctx.lineWidth=1.2;
+  ctx.fillRect(20,-8,38,16); ctx.strokeRect(20,-8,38,16);
+  ctx.strokeStyle=`rgba(${teamRGB},0.35)`; ctx.lineWidth=0.6;
+  for(let i=1;i<4;i++){ctx.beginPath();ctx.moveTo(20+i*9.5,-8);ctx.lineTo(20+i*9.5,8);ctx.stroke();}
+  ctx.beginPath();ctx.moveTo(20,0);ctx.lineTo(58,0);ctx.stroke();
+  // Mât de connexion
+  ctx.fillStyle='#303050'; ctx.strokeStyle='rgba(180,180,220,0.5)'; ctx.lineWidth=1;
+  ctx.fillRect(-18,-4,36,8); ctx.strokeRect(-18,-4,36,8);
+  // Corps central
+  ctx.fillStyle=BEACON.capTeam==='blue'?'#0e2050':BEACON.capTeam==='red'?'#401010':'#18104a';
+  ctx.strokeStyle=`rgba(${teamRGB},0.9)`; ctx.lineWidth=1.8;
+  ctx.fillRect(-12,-13,24,26); ctx.strokeRect(-12,-13,24,26);
+  // Détails corps
+  ctx.fillStyle=`rgba(${teamRGB},0.25)`; ctx.fillRect(-8,-9,16,18);
+  // Antenne principale (haut)
+  ctx.strokeStyle='rgba(220,220,255,0.8)'; ctx.lineWidth=1.2;
+  ctx.beginPath(); ctx.moveTo(0,-13); ctx.lineTo(0,-22); ctx.stroke();
+  // Petite antenne latérale
+  ctx.beginPath(); ctx.moveTo(0,-22); ctx.lineTo(-7,-26); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0,-22); ctx.lineTo(7,-26); ctx.stroke();
+  // Feu clignotant
+  const _blink=Math.sin(Date.now()*0.006)>0.3;
+  if(_blink){
+    ctx.beginPath(); ctx.arc(0,-22,2.5,0,Math.PI*2);
+    ctx.fillStyle=BEACON.capTeam==='blue'?'#60d0ff':BEACON.capTeam==='red'?'#ff6040':'#c0a0ff';
+    ctx.fill();
   }
-  // Indicateur de révélation active
-  if(BEACON.revealTimer>0){
-    const a=BEACON.revealTimer/1800;
-    ctx.fillStyle=`rgba(255,230,80,${a*0.8})`; ctx.font='bold 11px monospace'; ctx.textAlign='center';
-    ctx.fillText(`RADAR ×3  ${Math.ceil(BEACON.revealTimer/60)}s`,sx,sy+BEACON.r+24); ctx.textAlign='left';
+  // Propulseur bas
+  ctx.fillStyle='#404060'; ctx.fillRect(-4,13,8,6); ctx.strokeStyle='rgba(180,180,220,0.4)'; ctx.strokeRect(-4,13,8,6);
+  ctx.restore();
+  // ── Barre de capture ──
+  const _ct=BEACON.contestTeam||BEACON.capTeam;
+  if(BEACON.progress>0&&_ct){
+    const bw=90;
+    ctx.fillStyle='rgba(0,0,20,0.75)'; ctx.fillRect(sx-bw/2,sy-50,bw,7); ctx.strokeStyle='rgba(180,180,220,0.3)'; ctx.lineWidth=0.8; ctx.strokeRect(sx-bw/2,sy-50,bw,7);
+    ctx.fillStyle=_ct==='blue'?'#4aadff':'#ff6050';
+    ctx.fillRect(sx-bw/2,sy-50,bw*(BEACON.progress/BEACON_CAP),7);
+  }
+  // ── Label équipe ──
+  if(BEACON.capTeam){
+    ctx.font='bold 9px monospace'; ctx.textAlign='center';
+    ctx.fillStyle=BEACON.capTeam==='blue'?'rgba(80,180,255,0.9)':'rgba(255,100,70,0.9)';
+    ctx.fillText(BEACON.capTeam==='blue'?'[BLEUS]':'[ROUGES]',sx,sy+52);
+    ctx.textAlign='left';
   }
 }
 
@@ -2566,8 +2854,9 @@ function drawAIFleet(fleet,fillColT1,strokeColT1,barCol,rgb){
     drawShield(sx,sy,aiR,ai,rgb);
     if(ai.immuneTimer>0&&Math.floor(ai.immuneTimer/5)%2===0) continue;
     ctx.save(); ctx.translate(sx,sy); ctx.rotate(ai.angle);
-    // Couleur uniforme par équipe (même palette que T1)
-    const _fc=fillColT1, _sc=strokeColT1;
+    // Couleur uniforme par équipe (palette mercenaire si applicable)
+    const _fc=ai.isMercenary?(ai.team==='blue'?'#091830':'#380a08'):fillColT1;
+    const _sc=ai.isMercenary?(ai.team==='blue'?'#18c898':'#e07820'):strokeColT1;
     const fc=ai.hit>0?'#c8cce8':_fc, sc=ai.hit>0?'#ffffff':_sc;
     if(ai.shipType===3){
       // ── Type 3 : grand cuirassé ──────────────────────────────────────────
@@ -2719,8 +3008,7 @@ function drawRadarArrows(){
   if(ship.dead) return;
   const cx=canvas.width/2, cy=canvas.height/2;
   const RADAR_R=Math.min(460, Math.min(canvas.width,canvas.height)*0.41);
-  const beaconReveal=BEACON.revealTimer>0&&BEACON.revealTeam===ship.team;
-  const playerInNebula=!beaconReveal&&nebulaFactor(_camX,_camY)<1;
+  const playerInNebula=nebulaFactor(_camX,_camY)<1;
   // Flèches vaisseaux
   for(const ai of [...blues,...reds]){
     if(ai.dead) continue;
@@ -2729,10 +3017,8 @@ function drawRadarArrows(){
     const dx=ai.x-_camX, dy=ai.y-_camY;
     const dist=Math.hypot(dx,dy);
     const isEnemy=ai.team!==ship.team;
-    if(!beaconReveal){
-      // Ennemi caché dans une nébuleuse ?
-      if(isEnemy&&nebulaFactor(ai.x,ai.y)<1&&dist>RADAR_RANGE*0.28) continue;
-    }
+    // Ennemi caché dans une nébuleuse ?
+    if(isEnemy&&nebulaFactor(ai.x,ai.y)<1&&dist>RADAR_RANGE*0.28) continue;
     const ssx=dx+cx, ssy=dy+cy;
     if(ssx>0&&ssx<canvas.width&&ssy>0&&ssy<canvas.height) continue;
     const angle=Math.atan2(dy,dx);
@@ -2774,7 +3060,7 @@ function drawRadarArrows(){
       const angle=Math.atan2(dy,dx);
       const ax=cx+Math.cos(angle)*(RADAR_R-45), ay=cy+Math.sin(angle)*(RADAR_R-45);
       ctx.save(); ctx.translate(ax,ay); ctx.rotate(angle);
-      ctx.fillStyle=BEACON.revealTimer>0?'rgba(255,230,50,0.8)':'rgba(180,150,255,0.65)';
+      ctx.fillStyle='rgba(180,150,255,0.65)';
       ctx.font='10px monospace'; ctx.textAlign='center';
       ctx.fillText('📡',0,4); ctx.textAlign='left';
       ctx.restore();
@@ -2810,8 +3096,7 @@ function drawHUD(){
   // Retour visuel joueur : HIT / KILL / FORMATION
   for(const fb of playerFeedback){
     const t=fb.life/fb.maxLife;
-    ctx.save();
-    ctx.textAlign='center';
+    ctx.save(); ctx.textAlign='center';
     if(fb.type==='formDeath'){
       const sz=(isMobile?11:18)+5*(1-t);
       ctx.font=`bold ${sz.toFixed(0)}px monospace`;
@@ -2825,16 +3110,42 @@ function drawHUD(){
       ctx.shadowColor='#4aadff'; ctx.shadowBlur=18*t;
       ctx.fillStyle=`rgba(140,210,255,${t})`;
       ctx.fillText(fb.label, W/2, H/2-45-row*(isMobile?18:26)-(1-t)*14);
-    } else {
-      const isKill=fb.type==='kill';
-      const label=isKill?'KILL !':'TOUCHÉ';
-      const col=isKill?`rgba(255,220,50,${t})`:`rgba(100,220,255,${t})`;
-      const sz=isKill?(28+12*(1-t)):(20+6*(1-t));
+    } else if(fb.type==='kill'){
+      const label=fb.label||'KILL';
+      const streak=fb.streak||1;
+      const col=streak>=3?`rgba(255,100,50,${t})`:streak===2?`rgba(255,180,40,${t})`:`rgba(255,220,50,${t})`;
+      const shadow=streak>=3?'#ff3300':streak===2?'#ff8800':'#ff9900';
+      const sz=(isMobile?20:28)+8*(1-t)+(streak>=3?6:streak===2?3:0);
       ctx.font=`bold ${sz.toFixed(0)}px monospace`;
-      ctx.shadowColor=isKill?'#ff9900':'#00ccff';
-      ctx.shadowBlur=18*t;
+      ctx.shadowColor=shadow; ctx.shadowBlur=20*t;
       ctx.fillStyle=col;
-      ctx.fillText(label, W*0.62, H/2+(isKill?-10:10)+(1-t)*20);
+      ctx.fillText(label, W*0.62, H/2-18+(1-t)*-18);
+      if(fb.pts){
+        ctx.font=`bold ${isMobile?13:17}px monospace`;
+        ctx.fillStyle=`rgba(255,240,120,${t*0.9})`;
+        ctx.shadowColor='#ffaa00'; ctx.shadowBlur=8*t;
+        ctx.fillText(fb.pts, W*0.62, H/2+8+(1-t)*-14);
+      }
+    } else if(fb.type==='cap'){
+      const sz=(isMobile?13:18)+4*(1-t);
+      ctx.font=`bold ${sz.toFixed(0)}px monospace`;
+      ctx.shadowColor='#00ff88'; ctx.shadowBlur=16*t;
+      ctx.fillStyle=`rgba(80,255,160,${t})`;
+      ctx.fillText(fb.label||'CAPTURE', W*0.62, H/2-14+(1-t)*-16);
+      if(fb.pts){
+        ctx.font=`bold ${isMobile?12:15}px monospace`;
+        ctx.fillStyle=`rgba(160,255,200,${t*0.85})`;
+        ctx.shadowColor='#00cc66'; ctx.shadowBlur=6*t;
+        ctx.fillText(fb.pts, W*0.62, H/2+8+(1-t)*-12);
+      }
+    } else {
+      // hit
+      const col=`rgba(100,220,255,${t*0.7})`;
+      const sz=(isMobile?11:15)+3*(1-t);
+      ctx.font=`bold ${sz.toFixed(0)}px monospace`;
+      ctx.shadowColor='#00aacc'; ctx.shadowBlur=8*t;
+      ctx.fillStyle=col;
+      ctx.fillText('+8', W*0.62, H/2+22+(1-t)*8);
     }
     ctx.restore();
   }
@@ -2962,11 +3273,7 @@ function drawHUD(){
       ctx.fillText('⚡  ZONE EMP — MOTEURS COUPÉS  ⚡',W/2,H/2+55); ctx.textAlign='left';
     }
   }
-  if(BEACON.revealTimer>0){
-    const bCol=BEACON.revealTeam==='blue'?'#4aadff':'#ff6050';
-    ctx.fillStyle=bCol; ctx.font='bold 11px monospace'; ctx.textAlign='center';
-    ctx.fillText(`📡 RADAR ×3 : ${Math.ceil(BEACON.revealTimer/60)}s`,W/2,isMobile?H-18:H-48); ctx.textAlign='left';
-  }
+  // (beacon mercenaires : pas d'affichage HUD dédié)
   if(meteorWarn>120){
     const mAlpha=Math.min(1,(meteorWarn-120)/60);
     ctx.fillStyle=`rgba(255,150,0,${mAlpha*0.9})`; ctx.font='bold 13px monospace'; ctx.textAlign='center';
@@ -3059,9 +3366,86 @@ function drawGameOver(){
     ctx.fillText(`HI-SCORE  ${hiStr}`,W/2,H/2+48);
   }
   ctx.font='11px monospace'; ctx.fillStyle='rgba(150,170,210,0.6)';
-  ctx.fillText(`KILLS : ${_kills}   CAPTURES : ${_caps}`,W/2,H/2+68);
+  ctx.fillText(`KILLS : ${_kills}   CAPTURES : ${_caps}   DGT : ${_dmgDealt}`,W/2,H/2+68);
+  // ── Leaderboard bots (toutes équipes, multi-colonnes) ──
+  if(!isMobile){
+    // Entrée joueur synthétique
+    const _playerEntry={name:'JOUEUR',team:'blue',kills:_kills,caps:_caps,dmgDealt:_dmgDealt,isPlayer:true};
+    const allBots=[_playerEntry,...blues,...reds].filter(a=>a.isPlayer||((!a.isMercenary&&a.shipType!==3)));
+    allBots.sort((a,b)=>b.kills-a.kills||b.dmgDealt-a.dmgDealt);
+    if(allBots.length>0){
+      // Layout : 2 colonnes côte à côte, chacune avec son propre tableau
+      const rowH=14, colW=W*0.46, colGap=W*0.04;
+      const lbTop=H/2+82;
+      const lbAvailH=H-lbTop-34;
+      const maxRows=Math.floor(lbAvailH/rowH);
+      const half=Math.ceil(allBots.length/2);
+      const cols=[[allBots.slice(0,half),W*0.03],[allBots.slice(half),W*0.03+colW+colGap]];
+      // En-tête séparateur
+      ctx.strokeStyle='rgba(200,200,255,0.18)'; ctx.lineWidth=1;
+      ctx.beginPath(); ctx.moveTo(W*0.03,lbTop-6); ctx.lineTo(W*0.97,lbTop-6); ctx.stroke();
+      ctx.font='bold 8px monospace'; ctx.fillStyle='rgba(160,160,210,0.55)'; ctx.textAlign='left';
+      ctx.fillText('CLASSEMENT DES PILOTES',W*0.03,lbTop-10);
+      for(const [bots,colX] of cols){
+        // En-têtes colonnes
+        const hdrY=lbTop+4;
+        ctx.font='bold 8px monospace'; ctx.fillStyle='rgba(160,160,210,0.5)';
+        ctx.textAlign='left';  ctx.fillText('#  NOM',colX,hdrY);
+        ctx.textAlign='center';
+        ctx.fillText('K',colX+colW*0.52,hdrY);
+        ctx.fillText('CAP',colX+colW*0.64,hdrY);
+        ctx.fillText('DGT',colX+colW*0.78,hdrY);
+        ctx.textAlign='right'; ctx.fillText('EQ',colX+colW,hdrY);
+        ctx.textAlign='left';
+        // Ligne séparatrice en-tête
+        ctx.strokeStyle='rgba(180,180,255,0.1)'; ctx.lineWidth=0.5;
+        ctx.beginPath(); ctx.moveTo(colX,hdrY+3); ctx.lineTo(colX+colW,hdrY+3); ctx.stroke();
+        for(let i=0;i<Math.min(bots.length,maxRows);i++){
+          const bot=bots[i];
+          // Index global pour podium
+          const gi=allBots.indexOf(bot);
+          const y=lbTop+14+i*rowH;
+          const tCol=bot.team==='blue'?'rgba(70,160,255,0.9)':'rgba(255,95,65,0.9)';
+          const isPodium=gi<3;
+          const podCol=gi===0?'#ffd700':gi===1?'#c0c0c0':'#cd7f32'; // or/argent/bronze
+          // Fond léger pour le podium
+          if(bot.isPlayer){
+            ctx.fillStyle='rgba(80,80,20,0.35)';
+            ctx.fillRect(colX-2,y-rowH+3,colW+4,rowH);
+          } else if(isPodium){
+            ctx.fillStyle=`rgba(${bot.team==='blue'?'30,80,180':'160,40,20'},0.18)`;
+            ctx.fillRect(colX-2,y-rowH+3,colW+4,rowH);
+          }
+          // Rang
+          ctx.font=isPodium?'bold 8px monospace':'8px monospace';
+          ctx.fillStyle=isPodium?podCol:'rgba(120,120,160,0.6)';
+          ctx.textAlign='left';
+          ctx.fillText(`${gi+1}.`,colX,y);
+          // Nom
+          ctx.fillStyle=isPodium?tCol:(bot.team==='blue'?'rgba(100,160,255,0.75)':'rgba(255,120,90,0.75)');
+          ctx.fillText(bot.name,colX+18,y);
+          // Stats
+          ctx.textAlign='center';
+          // Kills
+          ctx.fillStyle=isPodium?'rgba(255,220,60,0.95)':'rgba(200,190,120,0.65)';
+          ctx.fillText(bot.kills,colX+colW*0.52,y);
+          // Caps
+          ctx.fillStyle='rgba(80,220,140,0.7)';
+          ctx.fillText(bot.caps,colX+colW*0.64,y);
+          // Dégâts
+          ctx.fillStyle='rgba(180,130,255,0.65)';
+          ctx.fillText(bot.dmgDealt,colX+colW*0.78,y);
+          // Équipe
+          ctx.textAlign='right'; ctx.fillStyle=tCol;
+          ctx.fillText(bot.team==='blue'?'B':'R',colX+colW,y);
+          ctx.textAlign='left';
+        }
+      }
+    }
+  }
   const blink=Math.floor(Date.now()/600)%2===0;
-  if(blink){ctx.fillStyle='rgba(200,190,160,0.75)';ctx.font='bold 14px monospace';ctx.fillText(isMobile?'— APPUYEZ POUR REJOUER —':'— APPUYEZ SUR F5 POUR REJOUER —',W/2,H/2+96);}
+  const replayY=isMobile?H/2+96:H-28;
+  if(blink){ctx.fillStyle='rgba(200,190,160,0.75)';ctx.font='bold 14px monospace';ctx.textAlign='center';ctx.fillText(isMobile?'— APPUYEZ POUR REJOUER —':'— APPUYEZ SUR F5 POUR REJOUER —',W/2,replayY);}
   ctx.textAlign='left';
 }
 
@@ -3102,15 +3486,14 @@ function drawMinimap(){
     ng.addColorStop(1,'rgba(0,0,0,0)');
     ctx.beginPath(); ctx.arc(npx,npy,nr,0,Math.PI*2); ctx.fillStyle=ng; ctx.fill();
   }
-  const mmBeaconReveal=BEACON.revealTimer>0&&BEACON.revealTeam===ship.team;
-  const mmPlayerInNebula=!mmBeaconReveal&&nebulaFactor(_camX,_camY)<1;
+  const mmPlayerInNebula=nebulaFactor(_camX,_camY)<1;
   // Rouges
   ctx.fillStyle='#ff6050';
   for(const ai of reds){ if(ai.dead)continue;
     // Joueur dans nébuleuse → minimap entièrement brouillée
     if(mmPlayerInNebula) continue;
     // Ennemi dans une nébuleuse → masqué
-    if(!mmBeaconReveal&&nebulaFactor(ai.x,ai.y)<1) continue;
+    if(nebulaFactor(ai.x,ai.y)<1) continue;
     const px=MX+(ai.x+MAP_RADIUS)*scale, py=MY+(ai.y+MAP_RADIUS)*scale;
     ctx.beginPath(); ctx.arc(px,py,ai.shipType===3?4:1.5,0,Math.PI*2); ctx.fill();
   }
@@ -3148,7 +3531,7 @@ function drawMinimap(){
   }
   // Balise
   {const bpx=MX+(BEACON.x+MAP_RADIUS)*scale, bpy=MY+(BEACON.y+MAP_RADIUS)*scale;
-  ctx.strokeStyle=BEACON.revealTimer>0?'#ffdd44':'rgba(180,160,255,0.8)'; ctx.lineWidth=1.2;
+  ctx.strokeStyle=BEACON.capTeam==='blue'?'#4aadff':BEACON.capTeam==='red'?'#ff6050':'rgba(180,160,255,0.8)'; ctx.lineWidth=1.2;
   ctx.beginPath(); ctx.arc(bpx,bpy,3,0,Math.PI*2); ctx.stroke();}
   // Astéroïdes en vol
   ctx.fillStyle='rgba(255,150,60,0.8)';
